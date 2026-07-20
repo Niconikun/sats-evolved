@@ -1,0 +1,1652 @@
+"""
+Simulación Evolutiva Avanzada de Satélites en Órbita
+
+Este módulo implementa un modelo de simulación de una constelación de
+satélites que envejece, falla y se reproduce con el paso del tiempo,
+inspirado en dinámicas de selección natural.
+
+Cada satélite (:class:`Satellite`) nace con una "calidad inherente"
+aleatoria que determina su tasa de falla base. La calidad se hereda (con
+mutación) al crear satélites "hijo", por lo que, con el paso de las
+generaciones, la población tiende a desplazarse hacia mayor calidad
+promedio (presión de selección).
+
+El motor de la simulación (:class:`SimulacionSatelites`) avanza el
+tiempo día a día aplicando, en orden:
+
+1. Efectos ambientales (drag atmosférico, presión de radiación solar,
+   radiación cósmica, metabolismo) que pueden causar la muerte del
+   satélite.
+2. Evaluación de muertes por edad máxima, falla probabilística (tasas
+   de falla aditivas, ver :meth:`Satellite.calcular_lambda_total`) y
+   colisión con debris espacial.
+3. Lanzamiento de nuevos satélites (nuevos o "hijos" reproducidos) cada
+   cierto intervalo de días.
+
+Subsistemas ambientales incluidos:
+- Degradación orbital (drag atmosférico)
+- Debris espacial (colisiones)
+- Ciclos solares + presión de radiación solar
+- Radiación cósmica acumulativa
+- Maniobrabilidad (cambio orbital)
+- Heredabilidad (reproducción selectiva)
+- Metabolismo (energía/combustible)
+
+Unidades: las distancias orbitales (a, altitud, perigeo, apogeo) están
+en kilómetros, los ángulos (i, Omega, omega, M) en grados, el tiempo en
+días y las magnitudes de calidad/energía/combustible/radiación están
+normalizadas entre 0 y 1 (o 0-100 para energía/combustible en "%").
+"""
+
+import numpy as np
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
+import random
+from scipy.stats import weibull_min, lognorm
+
+# Constante gravitacional terrestre estándar (GM), en km^3/s^2
+GM_TIERRA_KM3_S2 = 398600.4
+RADIO_TIERRA_KM = 6371.0
+
+
+# =============================================================================
+# CONFIGURACIÓN FÍSICA CENTRALIZADA
+# =============================================================================
+
+@dataclass
+class ConfiguracionFisica:
+    """
+    Agrupa las constantes físicas y parámetros del modelo que antes
+    estaban hardcodeados dentro de los métodos, para facilitar la
+    experimentación (ej. barridos de sensibilidad) y las pruebas sin
+    tener que editar el código del motor de simulación.
+
+    Los valores por defecto reproducen exactamente el comportamiento
+    numérico previo (ninguno de estos cambios altera resultados por sí
+    solo, solo centraliza dónde se definen).
+    """
+    # Orbitales/gravitacionales
+    gm_tierra_km3_s2: float = GM_TIERRA_KM3_S2
+    radio_tierra_km: float = RADIO_TIERRA_KM
+
+    # Drag atmosférico
+    coeficiente_drag_cd: float = 2.2
+
+    # Radiación cósmica
+    limite_radiacion: float = 1.0
+
+    # Envejecimiento (curva de bañera, fase de desgaste vía Weibull)
+    escala_envejecimiento_anos: float = 3.0
+    forma_envejecimiento_k: float = 2.0
+
+    # Metabolismo
+    consumo_energico_diario_pct: float = 5.0
+
+    # Tasas aditivas de falla (ver Satellite.calcular_lambda_total)
+    factor_lambda_radiacion: float = 0.002
+    factor_lambda_debris: float = 0.005
+    umbral_energia_baja_pct: float = 20.0
+    factor_lambda_energia: float = 0.0005
+    umbral_combustible_bajo_pct: float = 10.0
+    lambda_combustible_bajo: float = 0.002
+
+    # Debris: energía de referencia para fragmentación (colisión/explosión)
+    energia_referencia_colision_j: float = 5e10
+    fragmentos_base_colision: float = 50.0
+    fragmentos_base_explosion: float = 30.0
+
+
+# =============================================================================
+# MODELO ATMOSFÉRICO
+# =============================================================================
+
+# Modelo de atmósfera exponencial por capas (referencia estándar en
+# astrodinámica, ver Vallado, "Fundamentals of Astrodynamics and
+# Applications", tabla de densidad exponencial). Cada tupla es
+# (altitud_base_km, densidad_base_kg_m3, altura_de_escala_km). La
+# densidad a una altitud h dentro de una capa se calcula como
+# rho0 * exp(-(h - h0) / H), lo que reproduce razonablemente bien el
+# perfil real de densidad atmosférica entre ~100 y ~1000 km, la zona
+# relevante para el drag orbital de satélites LEO.
+_TABLA_ATMOSFERA_EXPONENCIAL: List[Tuple[float, float, float]] = [
+    (0, 1.225, 7.249),
+    (100, 5.297e-7, 5.877),
+    (110, 9.661e-8, 7.263),
+    (120, 2.438e-8, 9.473),
+    (130, 8.484e-9, 12.636),
+    (140, 3.845e-9, 16.149),
+    (150, 2.070e-9, 22.523),
+    (180, 5.464e-10, 29.740),
+    (200, 2.789e-10, 37.105),
+    (250, 7.248e-11, 45.546),
+    (300, 2.418e-11, 53.628),
+    (350, 9.518e-12, 53.298),
+    (400, 3.725e-12, 58.515),
+    (450, 1.585e-12, 60.828),
+    (500, 6.967e-13, 63.822),
+    (600, 1.454e-13, 71.835),
+    (700, 3.614e-14, 88.667),
+    (800, 1.170e-14, 124.64),
+    (900, 5.245e-15, 181.05),
+    (1000, 3.019e-15, 268.00),
+]
+
+# Arrays derivados de la tabla anterior, usados para el lookup
+# vectorizado de densidad atmosférica (ver
+# :func:`densidad_atmosferica_kg_m3_batch`).
+_ALTITUDES_BASE = np.array([capa[0] for capa in _TABLA_ATMOSFERA_EXPONENCIAL])
+_DENSIDADES_BASE = np.array([capa[1] for capa in _TABLA_ATMOSFERA_EXPONENCIAL])
+_ESCALAS_ALTURA = np.array([capa[2] for capa in _TABLA_ATMOSFERA_EXPONENCIAL])
+
+
+def densidad_atmosferica_kg_m3(altitud_km: float) -> float:
+    """
+    Densidad atmosférica estimada a una altitud dada, usando un modelo
+    exponencial por capas (kg/m^3).
+
+    Debajo de 100 km usa la capa base (troposfera/estratosfera); por
+    encima de 1000 km reutiliza la última capa (exosfera, densidad ya
+    despreciable para efectos de drag).
+
+    Args:
+        altitud_km: altitud sobre la superficie terrestre, en km.
+
+    Returns:
+        Densidad atmosférica en kg/m^3.
+    """
+    altitud_km = max(altitud_km, 0.0)
+    capa = _TABLA_ATMOSFERA_EXPONENCIAL[0]
+    for candidata in _TABLA_ATMOSFERA_EXPONENCIAL:
+        if altitud_km >= candidata[0]:
+            capa = candidata
+        else:
+            break
+    altitud_base, densidad_base, altura_escala = capa
+    return densidad_base * np.exp(-(altitud_km - altitud_base) / altura_escala)
+
+
+def densidad_atmosferica_kg_m3_batch(altitudes_km: np.ndarray) -> np.ndarray:
+    """
+    Versión vectorizada de :func:`densidad_atmosferica_kg_m3`: calcula
+    la densidad atmosférica para un array completo de altitudes en una
+    sola pasada (usando búsqueda binaria en vez de un bucle Python por
+    satélite). Esto es clave para escalar la simulación a miles de
+    satélites (ver Fase 3 de la hoja de ruta: vectorización).
+
+    Args:
+        altitudes_km: array de altitudes (km).
+
+    Returns:
+        Array de densidades atmosféricas (kg/m^3), mismo shape que la entrada.
+    """
+    altitudes = np.clip(np.asarray(altitudes_km, dtype=float), 0.0, None)
+    # índice de la capa aplicable para cada altitud (búsqueda binaria)
+    indices = np.searchsorted(_ALTITUDES_BASE, altitudes, side="right") - 1
+    indices = np.clip(indices, 0, len(_ALTITUDES_BASE) - 1)
+    return _DENSIDADES_BASE[indices] * np.exp(
+        -(altitudes - _ALTITUDES_BASE[indices]) / _ESCALAS_ALTURA[indices]
+    )
+
+
+# =============================================================================
+# SISTEMAS AMBIENTALES
+# =============================================================================
+
+class CicloSolar:
+    """Modela ciclos solares (11 años) que afectan drag y radiación."""
+    
+    def __init__(self, fase_inicial: float = 0.5):
+        """
+        Args:
+            fase_inicial: fase del ciclo (0 a 1, siendo 0=mínimo, 1=máximo)
+        """
+        self.fase = fase_inicial
+        self.ciclo_dias = 11 * 365.25  # ciclo de 11 años
+    
+    def actividad_solar(self, dias_transcurridos: float) -> float:
+        """
+        Retorna actividad solar normalizada (0 a 1).
+        
+        Args:
+            dias_transcurridos: días desde inicio de simulación
+            
+        Returns:
+            actividad solar (0=mínima, 1=máxima)
+        """
+        posicion_ciclo = (dias_transcurridos / self.ciclo_dias) % 1.0
+        # Ciclo sinusoidal
+        actividad = 0.5 + 0.5 * np.sin(2 * np.pi * posicion_ciclo)
+        return actividad
+    
+    def presion_radiacion_solar(self, actividad: float) -> float:
+        """Presión de radiación solar (afecta órbitas con baja masa)."""
+        # Pa (Pascal) normalizado
+        presion_base = 4.5e-6  # Pa
+        return presion_base * (0.5 + 1.5 * actividad)
+    
+    def drag_atmosferico(self, actividad: float) -> float:
+        """Coeficiente de drag atmosférico normalizado."""
+        # Mayor actividad solar → mayor expansión atmosférica → más drag
+        return 1.0 + 2.0 * actividad
+
+
+class RadiacionCosmica:
+    """Modela daño acumulativo por radiación cósmica."""
+    
+    def __init__(self, tasa_base: float = 0.001):
+        """
+        Args:
+            tasa_base: tasa de daño por día (0 a 1)
+        """
+        self.tasa_base = tasa_base
+    
+    def damage_diario(self) -> float:
+        """Retorna daño acumulativo de un día."""
+        return self.tasa_base
+
+
+class DebrisEspacial:
+    """
+    Gestiona población de debris que pueden colisionar con satélites.
+
+    A diferencia de un modelo de densidad global única, la población de
+    debris se segmenta por banda orbital (inspirado en modelos de
+    referencia como NASA ORDEM / ESA MASTER, que discretizan el flujo
+    de debris por altitud e inclinación). Cada banda tiene su propia
+    densidad, su propia tasa de decaimiento natural (arrastre
+    atmosférico: las bandas bajas se "autolimpian" mucho más rápido que
+    GEO) y su propio riesgo de colisión asociado.
+
+    Bandas modeladas:
+        - "bajo" (<400 km): decae muy rápido por drag atmosférico.
+        - "leo_congestionado" (400-2000 km): la zona más poblada de
+          debris rastreable (jerga: "LEO congestionado").
+        - "meo" (2000-35786 km): decaimiento muy lento (siglos).
+        - "geo" (>35786 km): decaimiento casi nulo (milenios).
+
+    Attributes:
+        densidad_por_banda: cantidad de objetos de debris estimados por
+            banda orbital.
+        colisiones_totales: contador acumulado de colisiones satélite-debris.
+    """
+
+    # (nombre_banda, altitud_min_km, altitud_max_km, tasa_decaimiento_diaria)
+    _BANDAS: List[Tuple[str, float, float, float]] = [
+        ("bajo", 0.0, 400.0, 0.010),
+        ("leo_congestionado", 400.0, 2000.0, 0.0002),
+        ("meo", 2000.0, 35786.0, 0.00002),
+        ("geo", 35786.0, float("inf"), 0.000005),
+    ]
+
+    # Escala de normalización (0-1) y riesgo base de colisión por banda
+    _ESCALA_NORMALIZACION = {
+        "bajo": 200.0,
+        "leo_congestionado": 1500.0,
+        "meo": 500.0,
+        "geo": 200.0,
+    }
+    _RIESGO_BASE = {
+        "bajo": 0.0005,
+        "leo_congestionado": 0.05,
+        "meo": 0.01,
+        "geo": 0.0005,
+    }
+
+    def __init__(self, densidad_inicial: int = 100, config: Optional[ConfiguracionFisica] = None):
+        """
+        Args:
+            densidad_inicial: cantidad inicial total de debris,
+                distribuida entre bandas según su congestión típica
+                (mayormente en "leo_congestionado").
+            config: configuración física centralizada (ver
+                :class:`ConfiguracionFisica`); si es None, se usan los
+                valores por defecto.
+        """
+        self.config = config or ConfiguracionFisica()
+        proporciones = {"bajo": 0.05, "leo_congestionado": 0.70,
+                       "meo": 0.20, "geo": 0.05}
+        self.densidad_por_banda: Dict[str, float] = {
+            banda: densidad_inicial * proporciones[banda]
+            for banda, _, _, _ in self._BANDAS
+        }
+        self.generado_ultimo_dia: Dict[str, float] = {
+            banda: 0.0 for banda, _, _, _ in self._BANDAS
+        }
+        self.ultimo_riesgo_cascada: Dict[str, float] = {
+            banda: 0.0 for banda, _, _, _ in self._BANDAS
+        }
+        self.colisiones_totales = 0
+
+    @property
+    def densidad(self) -> float:
+        """Cantidad total de debris sumando todas las bandas (compatibilidad)."""
+        return sum(self.densidad_por_banda.values())
+
+    def _banda_de_altitud(self, altitud_km: float) -> str:
+        """Determina a qué banda orbital pertenece una altitud dada."""
+        for banda, alt_min, alt_max, _ in self._BANDAS:
+            if alt_min <= altitud_km < alt_max:
+                return banda
+        return self._BANDAS[-1][0]
+
+    def densidad_normalizada_banda(self, banda: str) -> float:
+        """Densidad normalizada (0 a 1) de una banda orbital específica."""
+        escala = self._ESCALA_NORMALIZACION[banda]
+        return min(self.densidad_por_banda[banda] / escala, 1.0)
+
+    def densidad_normalizada(self) -> float:
+        """
+        Densidad normalizada (0 a 1) "headline", usando la banda LEO
+        congestionada como referencia principal (la más relevante para
+        la mayoría de los satélites simulados).
+        """
+        return self.densidad_normalizada_banda("leo_congestionado")
+
+    def probabilidad_colision(self, altitud_km: float) -> float:
+        """
+        Calcula probabilidad de colisión diaria según la altitud del
+        satélite y la densidad de debris de su banda orbital.
+
+        Args:
+            altitud_km: altitud del satélite sobre la Tierra.
+
+        Returns:
+            probabilidad de colisión diaria (0 a 0.1).
+        """
+        banda = self._banda_de_altitud(altitud_km)
+        riesgo_base = self._RIESGO_BASE[banda] * self.densidad_normalizada_banda(banda)
+        return min(riesgo_base, 0.1)  # máximo 10% de probabilidad
+
+    def probabilidad_colision_batch(self, altitudes_km: np.ndarray) -> np.ndarray:
+        """
+        Versión vectorizada de :meth:`probabilidad_colision` para calcular
+        la probabilidad de colisión diaria de una población completa de
+        satélites en una sola pasada (Fase 3: rendimiento y escala).
+
+        En vez de resolver la banda orbital y hacer lookups por
+        satélite en un loop de Python, se recorre solo la lista de
+        bandas (constante, ~4 elementos) aplicando una máscara booleana
+        por banda sobre el array completo de altitudes.
+
+        Args:
+            altitudes_km: array de altitudes (km) de todos los satélites.
+
+        Returns:
+            array de probabilidades de colisión diaria (0 a 0.1), mismo
+            orden/tamaño que `altitudes_km`.
+        """
+        altitudes = np.asarray(altitudes_km, dtype=float)
+        resultado = np.zeros_like(altitudes)
+        for banda, alt_min, alt_max, _ in self._BANDAS:
+            mascara = (altitudes >= alt_min) & (altitudes < alt_max)
+            riesgo_banda = min(
+                self._RIESGO_BASE[banda] * self.densidad_normalizada_banda(banda), 0.1
+            )
+            resultado[mascara] = riesgo_banda
+        return resultado
+
+    def generar_debris_por_colision(self, altitud_km: float, masa_kg: float,
+                                    velocidad_kms: float):
+        """
+        Genera fragmentos de debris proporcional a la energía cinética
+        de la colisión (masa × velocidad_relativa²), en lugar de una
+        cantidad fija. Modela el efecto Kessler: colisiones a alta
+        velocidad/masa generan cascadas de fragmentos mucho mayores
+        (ej. Cosmos-Iridium 2009: >2000 fragmentos rastreables).
+
+        Args:
+            altitud_km: altitud a la que ocurrió la colisión.
+            masa_kg: masa del satélite involucrado.
+            velocidad_kms: velocidad orbital relativa aproximada (km/s).
+        """
+        energia_j = 0.5 * masa_kg * (velocidad_kms * 1000.0) ** 2
+        # Referencia: 1000 kg a 10 km/s ≈ 5e10 J → ~50 fragmentos base
+        energia_referencia_j = self.config.energia_referencia_colision_j
+        fragmentos_base = self.config.fragmentos_base_colision
+        fragmentos = fragmentos_base * (energia_j / energia_referencia_j)
+        fragmentos = float(np.clip(fragmentos, 1.0, 3000.0))
+
+        banda = self._banda_de_altitud(altitud_km)
+        self.densidad_por_banda[banda] += fragmentos
+        self.generado_ultimo_dia[banda] += fragmentos
+
+    def generar_debris_derelicto(self, altitud_km: float, cantidad: float = 1.0):
+        """
+        Añade debris por un satélite que queda inactivo sin fragmentarse
+        (falla, fin de vida, falta de energía, etc.): el objeto derelicto
+        en sí mismo pasa a ser un objeto rastreable más en su banda.
+
+        Args:
+            altitud_km: altitud a la que quedó el satélite inactivo.
+            cantidad: cantidad de objetos de debris a añadir (por defecto 1,
+                representando el satélite derelicto mismo).
+        """
+        banda = self._banda_de_altitud(altitud_km)
+        self.densidad_por_banda[banda] += cantidad
+        self.generado_ultimo_dia[banda] += cantidad
+
+    def generar_debris_por_explosion(self, altitud_km: float, masa_kg: float,
+                                     fraccion_combustible_residual: float):
+        """
+        Genera debris por explosión/fragmentación de un satélite que
+        finalizó su misión sin ser pasivado y aún conserva combustible o
+        presión residual (riesgo real documentado en misiones que no
+        siguen buenas prácticas de fin de vida). La cantidad de
+        fragmentos escala con la masa del satélite y la fracción de
+        combustible residual (proxy de la energía almacenada que puede
+        liberarse), siendo más severa que la de un derelicto simple pero
+        menor que una colisión de alta energía típica.
+
+        Args:
+            altitud_km: altitud a la que ocurrió la explosión.
+            masa_kg: masa del satélite involucrado.
+            fraccion_combustible_residual: combustible residual (0 a 1).
+        """
+        fragmentos_base = self.config.fragmentos_base_explosion  # ref: 1000 kg, 100% combustible
+        fragmentos = fragmentos_base * (masa_kg / 1000.0) * fraccion_combustible_residual
+        fragmentos = float(np.clip(fragmentos, 1.0, 1500.0))
+
+        banda = self._banda_de_altitud(altitud_km)
+        self.densidad_por_banda[banda] += fragmentos
+        self.generado_ultimo_dia[banda] += fragmentos
+
+    def remover_debris(self, cantidad: float, banda: Optional[str] = None) -> float:
+        """
+        Remueve debris activamente (ADR - Active Debris Removal),
+        simulando misiones de remoción como ClearSpace-1. Si no se
+        especifica banda, prioriza automáticamente la banda con mayor
+        densidad normalizada (la más congestionada/riesgosa).
+
+        Args:
+            cantidad: cantidad de objetos de debris a remover.
+            banda: banda específica a targetear, o None para
+                autoseleccionar la banda más congestionada.
+
+        Returns:
+            Cantidad de debris efectivamente removido (limitada por la
+            disponibilidad en la banda seleccionada).
+        """
+        if banda is None:
+            banda = max(self.densidad_por_banda,
+                       key=lambda b: self.densidad_normalizada_banda(b))
+        removido = min(cantidad, self.densidad_por_banda[banda])
+        self.densidad_por_banda[banda] -= removido
+        return removido
+
+    def aplicar_decaimiento_diario(self) -> Dict[str, float]:
+        """
+        Aplica el decaimiento natural (arrastre atmosférico y
+        perturbaciones orbitales) a la densidad de debris de cada banda,
+        y calcula el "riesgo de cascada" de Kessler: la razón entre
+        debris generado y debris removido en el último día para cada
+        banda. Un valor > 1 indica que la población de debris de esa
+        banda está creciendo netamente (riesgo de cascada); < 1 indica
+        que el decaimiento natural supera a la generación.
+
+        Returns:
+            Diccionario {banda: riesgo_cascada} para cada banda orbital.
+        """
+        riesgo: Dict[str, float] = {}
+        for banda, _, _, tasa_decaimiento in self._BANDAS:
+            densidad_actual = self.densidad_por_banda[banda]
+            decaido = densidad_actual * tasa_decaimiento
+            self.densidad_por_banda[banda] = max(0.0, densidad_actual - decaido)
+
+            generado = self.generado_ultimo_dia[banda]
+            riesgo[banda] = generado / (decaido + 1e-6)
+            self.generado_ultimo_dia[banda] = 0.0
+
+        self.ultimo_riesgo_cascada = riesgo
+        return riesgo
+
+
+# =============================================================================
+# SATÉLITE MEJORADO
+# =============================================================================
+
+class Satellite:
+    """
+    Satélite avanzado con metabolismo, heredabilidad y degradación.
+
+    Modela un satélite individual con parámetros orbitales keplerianos,
+    un "metabolismo" simplificado (energía/combustible), daño acumulado
+    por radiación y degradación orbital, y una calidad inherente que se
+    hereda (con mutación) a sus satélites "hijo".
+
+    Attributes:
+        id: identificador único, autoincremental.
+        a, e, i, Omega, omega, M: parámetros keplerianos (a en km,
+            ángulos en grados).
+        masa_kg: masa del satélite en kg.
+        area_seccion: área de sección transversal simplificada (masa/1000).
+        calidad_inherente: calidad de construcción (0.1 a 1.0). A mayor
+            calidad, menor tasa de falla inherente.
+        lambda_inherente: tasa de falla base derivada de la calidad,
+            en fallos/día.
+        combustible: nivel de combustible para maniobras (0-100%).
+        energia: nivel de batería/energía (0-100%).
+        radiacion_acumulada: daño acumulado por radiación cósmica (0-1).
+        degradacion_orbital: degradación orbital acumulada por drag (0-1).
+        tiempo_lanzamiento: fecha/hora de lanzamiento del satélite.
+        activo: True mientras el satélite siga operativo.
+        causa_muerte: motivo de la falla una vez que `activo` es False.
+        pariente_id: id del satélite "padre", si fue reproducido.
+        pasivado: True si el satélite fue pasivado (combustible/batería
+            purgados) al fin de su misión, práctica estándar de
+            mitigación de debris que evita explosiones post-misión.
+    """
+    
+    _contador = 0
+    
+    def __init__(self, a: float, e: float, i: float, Omega: float, 
+                 omega: float, M: float, tiempo_lanzamiento: datetime,
+                 combustible: float = 100.0, energia: float = 100.0,
+                 masa_kg: float = 1000.0, pariente_id: Optional[int] = None,
+                 calidad_inherente: Optional[float] = None,
+                 config: Optional[ConfiguracionFisica] = None):
+        """
+        Args:
+            a, e, i, Omega, omega, M: parámetros keplerianos
+            tiempo_lanzamiento: datetime de lanzamiento
+            combustible: 0-100 (%)
+            energia: 0-100 (%)
+            masa_kg: masa del satélite
+            pariente_id: ID del satélite "padre" (para heredabilidad)
+            calidad_inherente: calidad de construcción (0.1 a 1.0)
+            config: configuración física centralizada (ver
+                :class:`ConfiguracionFisica`); si es None, se usan los
+                valores por defecto.
+        """
+        Satellite._contador += 1
+        self.id = Satellite._contador
+        self.config = config or ConfiguracionFisica()
+        
+        # Parámetros Keplerianos
+        self.a = a  # semieje mayor (km)
+        self.e = e  # excentricidad
+        self.i = i  # inclinación (grados)
+        self.Omega = Omega  # RAAN (grados)
+        self.omega = omega  # argumento del perigeo (grados)
+        self.M = M  # anomalía media (grados)
+        
+        # Propiedades físicas
+        self.masa_kg = masa_kg
+        self.area_seccion = masa_kg / 1000.0  # área simplificada
+        
+        # =====================================================================
+        # VARIABILIDAD INHERENTE: Cada satélite nace con diferente calidad
+        # =====================================================================
+        if calidad_inherente is None:
+            # Distribución normal: mayoría mediocres, algunos buenos/malos
+            self.calidad_inherente = np.clip(np.random.normal(0.5, 0.15), 0.1, 1.0)
+        else:
+            self.calidad_inherente = np.clip(calidad_inherente, 0.1, 1.0)
+        
+        # Tasa de falla inherente (inversamente proporcional a calidad)
+        # Satélite excelente (1.0): lambda_inherente ≈ 0.0001/día
+        # Satélite pobre (0.1): lambda_inherente ≈ 0.0009/día
+        self.lambda_inherente = (1.0 - self.calidad_inherente) * 0.001
+        
+        # Metabolismo
+        self.combustible = combustible  # para maniobras
+        self.energia = energia  # batería solar
+        self.consumo_energico_diario = self.config.consumo_energico_diario_pct  # % por día en operación
+        
+        # Radiación cósmica
+        self.radiacion_acumulada = 0.0  # 0 a 1
+        self.limite_radiacion = self.config.limite_radiacion
+        
+        # Degradación orbital
+        self.degradacion_orbital = 0.0  # 0 a 1
+        
+        # Estado
+        self.tiempo_lanzamiento = tiempo_lanzamiento
+        self.activo = True
+        self.causa_muerte: Optional[str] = None
+        self.pariente_id = pariente_id  # heredabilidad
+        
+        # Mitigación de debris: si el satélite fue pasivado (purga de
+        # combustible/batería residual) al fin de su misión.
+        self.pasivado = False
+    
+    def edad_dias(self, tiempo_actual: datetime) -> float:
+        """Calcula edad en días."""
+        return (tiempo_actual - self.tiempo_lanzamiento).total_seconds() / (24 * 3600)
+    
+    def altitud_km(self) -> float:
+        """Altitud sobre superficie terrestre."""
+        return self.a - self.config.radio_tierra_km
+    
+    def distancia_perigeo(self) -> float:
+        """Distancia del perigeo en km."""
+        r_p = self.a * (1 - self.e)
+        return r_p - self.config.radio_tierra_km
+    
+    def distancia_apogeo(self) -> float:
+        """Distancia del apogeo en km."""
+        r_a = self.a * (1 + self.e)
+        return r_a - self.config.radio_tierra_km
+    
+    def periodo_orbital(self) -> float:
+        """Período orbital en horas."""
+        T_segundos = 2 * np.pi * np.sqrt(self.a**3 / self.config.gm_tierra_km3_s2)
+        return T_segundos / 3600
+    
+    def velocidad_orbital_kms(self) -> float:
+        """
+        Velocidad orbital instantánea aproximada (ecuación vis-viva),
+        asumiendo órbita cuasi-circular (r ≈ a), en km/s.
+
+        Returns:
+            Velocidad orbital en km/s.
+        """
+        return float(np.sqrt(self.config.gm_tierra_km3_s2 / self.a))
+    
+    # =========================================================================
+    # DEGRADACIÓN ORBITAL
+    # =========================================================================
+    
+    def aplicar_drag_atmosferico(self, ciclo_solar: CicloSolar, dias_transcurridos: float):
+        """
+        Reduce semieje mayor por drag atmosférico usando la ecuación
+        física real de decaimiento orbital.
+
+        Se calcula la deceleración por drag en el perigeo/altitud actual
+        como α₀ = ½·ρ(R)·v²·cd·A/m (ecuación estándar de arrastre
+        atmosférico) y se obtiene la tasa de decaimiento del semieje
+        mayor promediada en una órbita como dR/dt = α₀·T/π, donde T es
+        el período orbital. La densidad atmosférica ρ(R) se obtiene de
+        un modelo exponencial por capas (:func:`densidad_atmosferica_kg_m3`)
+        modulado por la actividad solar (mayor actividad → atmósfera más
+        expandida → más drag). Esta formulación es la misma usada por
+        herramientas de referencia como el propagador de decaimiento
+        orbital ORBITM, validada contra telemetría real con ~5% de error.
+
+        Efecto secundario: si la altitud resultante cae por debajo de
+        100 km, marca al satélite como inactivo con causa "reentrada_orbital".
+
+        Args:
+            ciclo_solar: instancia de CicloSolar usada para obtener la
+                actividad solar actual y el coeficiente de drag asociado.
+            dias_transcurridos: días desde el inicio de la simulación.
+        """
+        actividad = ciclo_solar.actividad_solar(dias_transcurridos)
+        factor_solar = ciclo_solar.drag_atmosferico(actividad)  # 1.0 a 3.0
+        
+        cd = self.config.coeficiente_drag_cd  # coeficiente de forma típico (adimensional)
+        area_m2 = self.area_seccion  # aproximación simplificada (m^2)
+        
+        # Densidad atmosférica real a la altitud actual, ajustada por
+        # la expansión atmosférica asociada a la actividad solar.
+        rho = densidad_atmosferica_kg_m3(self.altitud_km()) * factor_solar
+        
+        # Velocidad orbital (m/s) y período orbital (s)
+        v_ms = self.velocidad_orbital_kms() * 1000.0
+        T_s = self.periodo_orbital() * 3600.0
+        
+        # Deceleración por drag: α₀ = ½·ρ·v²·cd·A/m  (m/s^2)
+        alpha_0 = 0.5 * rho * v_ms**2 * cd * area_m2 / self.masa_kg
+        
+        # Tasa de decaimiento del semieje mayor promediada en una órbita
+        # dR/dt = α₀·T/π  (m/s) → integrada un día completo (86400 s)
+        dR_dt_m_s = alpha_0 * T_s / np.pi
+        perdida_a_km = (dR_dt_m_s * 86400.0) / 1000.0  # km perdidos en 1 día
+        
+        self.a -= perdida_a_km
+        self.degradacion_orbital += perdida_a_km / 100  # track degradación
+        
+        # Reentrada orbital
+        if self.altitud_km() < 100:
+            self.activo = False
+            self.causa_muerte = "reentrada_orbital"
+    
+    # =========================================================================
+    # PRESIÓN DE RADIACIÓN SOLAR
+    # =========================================================================
+    
+    def aplicar_presion_radiacion_solar(self, ciclo_solar: CicloSolar, 
+                                        dias_transcurridos: float):
+        """
+        Afecta principalmente satélites ligeros.
+        Puede cambiar órbita ligeramente.
+
+        Incrementa levemente la excentricidad en función de la relación
+        área/masa del satélite y de la presión de radiación solar actual
+        (limitada a un máximo de 0.3).
+
+        Args:
+            ciclo_solar: instancia de CicloSolar usada para obtener la
+                presión de radiación solar según la actividad actual.
+            dias_transcurridos: días desde el inicio de la simulación.
+        """
+        actividad = ciclo_solar.actividad_solar(dias_transcurridos)
+        presion = ciclo_solar.presion_radiacion_solar(actividad)
+        
+        # Satélites más ligeros se ven más afectados
+        area_masa_ratio = self.area_seccion / self.masa_kg
+        
+        # Efecto en excentricidad (aumenta muy levemente)
+        delta_e = area_masa_ratio * presion * 1e-6
+        self.e += delta_e
+        self.e = min(self.e, 0.3)  # limitar excentricidad
+    
+    # =========================================================================
+    # RADIACIÓN CÓSMICA
+    # =========================================================================
+    
+    def aplicar_radiacion_cosmica(self, radiacion_cosmica: RadiacionCosmica):
+        """
+        Acumula daño de radiación cósmica.
+
+        Si el daño acumulado alcanza `limite_radiacion`, marca al
+        satélite como inactivo con causa "radiacion_cosmica".
+
+        Args:
+            radiacion_cosmica: instancia de RadiacionCosmica que provee
+                el daño diario a acumular.
+        """
+        damage = radiacion_cosmica.damage_diario()
+        self.radiacion_acumulada += damage
+        
+        if self.radiacion_acumulada >= self.limite_radiacion:
+            self.activo = False
+            self.causa_muerte = "radiacion_cosmica"
+    
+    # =========================================================================
+    # METABOLISMO
+    # =========================================================================
+    
+    def consumir_energia(self) -> bool:
+        """
+        Consume energía diariamente.
+        Retorna False si se queda sin energía.
+        """
+        self.energia -= self.consumo_energico_diario
+        if self.energia <= 0:
+            self.activo = False
+            self.causa_muerte = "falta_energia"
+            return False
+        return True
+    
+    def recargar_energia(self, cantidad: float):
+        """
+        Recarga energía (luz solar), sin superar el 100%.
+
+        Args:
+            cantidad: puntos porcentuales de energía a recargar.
+        """
+        self.energia = min(self.energia + cantidad, 100.0)
+    
+    def maniobra_orbital(self, delta_a: float, delta_e: float) -> bool:
+        """
+        Realiza maniobra orbital consumiendo combustible.
+        
+        Args:
+            delta_a, delta_e: cambios en semieje y excentricidad
+            
+        Returns:
+            True si la maniobra fue exitosa
+        """
+        costo_combustible = abs(delta_a) * 0.5 + abs(delta_e) * 10.0
+        
+        if self.combustible >= costo_combustible:
+            self.combustible -= costo_combustible
+            self.a += delta_a
+            self.e += delta_e
+            return True
+        return False
+    
+    def recargar_combustible(self, cantidad: float):
+        """
+        Recarga tanque de combustible, sin superar el 100%.
+
+        Args:
+            cantidad: puntos porcentuales de combustible a recargar.
+        """
+        self.combustible = min(self.combustible + cantidad, 100.0)
+    
+    # =========================================================================
+    # MITIGACIÓN DE DEBRIS: PASIVACIÓN Y DESORBITADO CONTROLADO
+    # =========================================================================
+    
+    def pasivar(self):
+        """
+        Pasiva el satélite al fin de su vida útil: purga el combustible
+        y la energía residual para prevenir explosiones/fragmentaciones
+        post-misión (práctica estándar de mitigación de debris, ej.
+        directrices IADC/ISO 24113).
+        """
+        self.combustible = 0.0
+        self.energia = 0.0
+        self.pasivado = True
+    
+    def intentar_desorbitado_controlado(self, altitud_objetivo_km: float = 300.0) -> bool:
+        """
+        Intenta una maniobra de desorbitación controlada al fin de la
+        misión, reduciendo el semieje mayor hacia una altitud objetivo
+        donde el decaimiento natural por drag es rápido, para cumplir
+        la "regla de los 25 años" (el satélite debe reentrar dentro de
+        25 años desde el fin de su misión). Reutiliza :meth:`maniobra_orbital`.
+
+        Args:
+            altitud_objetivo_km: altitud objetivo tras la maniobra (por
+                defecto 300 km).
+
+        Returns:
+            True si la maniobra se pudo ejecutar (combustible suficiente
+            o el satélite ya estaba por debajo de la altitud objetivo).
+        """
+        delta_a = altitud_objetivo_km - self.altitud_km()
+        if delta_a >= 0:
+            return True  # ya está por debajo de la altitud objetivo
+        return self.maniobra_orbital(delta_a, 0.0)
+    
+    # =========================================================================
+    # HEREDABILIDAD
+    # =========================================================================
+    
+    # =========================================================================
+    # CÁLCULO DE TASAS ADITIVAS DE FALLA
+    # =========================================================================
+    
+    def calcular_lambda_total(self, edad_dias: float, 
+                             riesgo_debris: float,
+                             ciclo_solar: 'CicloSolar') -> float:
+        """
+        Calcula tasa total de falla como SUMA de mecanismos independientes.
+        
+        Cada mecanismo contribuye con su propia tasa:
+        λ_total = λ_inherente + λ_envejecimiento + λ_radiación + 
+                  λ_debris + λ_energía + λ_combustible
+        
+        Args:
+            edad_dias: edad en días
+            riesgo_debris: probabilidad base de colisión (0-1)
+            ciclo_solar: instancia de CicloSolar
+            
+        Returns:
+            tasa de falla total (en unidades de fallos por día)
+        """
+        
+        # 1. λ_INHERENTE: Constante para cada satélite (su "genética")
+        lambda_inherente = self.lambda_inherente
+        
+        # 2. λ_ENVEJECIMIENTO: Curva de bañera Weibull
+        # Baja al inicio (rodaje), sube con edad (wear-out)
+        escala_dias = self.config.escala_envejecimiento_anos * 365.25  # años en días
+        k_forma = self.config.forma_envejecimiento_k  # parámetro de forma
+        
+        if edad_dias == 0:
+            lambda_envejecimiento = 0
+        else:
+            lambda_envejecimiento = (k_forma / escala_dias) * \
+                                   (edad_dias / escala_dias) ** (k_forma - 1)
+        
+        # 3. λ_RADIACIÓN: Acumula daño con el tiempo
+        # Mayor exposición = más daño acumulado
+        lambda_radiacion = self.radiacion_acumulada * self.config.factor_lambda_radiacion
+        
+        # 4. λ_DEBRIS: Riesgo de colisión (ambiental)
+        lambda_debris = riesgo_debris * self.config.factor_lambda_debris
+        
+        # 5. λ_ENERGÍA: Si batería baja, sistemas fallan
+        # Feedback metabolismo: energía baja = más fallos
+        umbral_energia = self.config.umbral_energia_baja_pct
+        if self.energia < umbral_energia:
+            lambda_energia = (umbral_energia - self.energia) * self.config.factor_lambda_energia
+        else:
+            lambda_energia = 0
+        
+        # 6. λ_COMBUSTIBLE: Sin combustible no puede maniobrar
+        # No puede evitar debris o ajustar órbita
+        if self.combustible < self.config.umbral_combustible_bajo_pct:
+            lambda_combustible = self.config.lambda_combustible_bajo
+        else:
+            lambda_combustible = 0
+        
+        # SUMA TOTAL DE TASAS
+        lambda_total = (lambda_inherente + lambda_envejecimiento + 
+                       lambda_radiacion + lambda_debris + 
+                       lambda_energia + lambda_combustible)
+        
+        return lambda_total
+    
+    def probabilidad_falla_diaria_aditiva(self, edad_dias: float,
+                                         riesgo_debris: float,
+                                         ciclo_solar: 'CicloSolar') -> float:
+        """
+        Convierte tasa total a probabilidad de falla en un día.
+        
+        P(falla en 1 día) = 1 - exp(-λ_total)
+        
+        Args:
+            edad_dias, riesgo_debris, ciclo_solar: como calcular_lambda_total
+            
+        Returns:
+            probabilidad de falla (0-1)
+        """
+        lambda_total = self.calcular_lambda_total(edad_dias, riesgo_debris, ciclo_solar)
+        # Convertir tasa a probabilidad de falla diaria
+        prob = 1 - np.exp(-lambda_total)
+        return min(prob, 1.0)
+    
+    def crear_hijo(self, tiempo_lanzamiento: datetime, 
+                   tasa_mutacion: float = 0.05) -> 'Satellite':
+        """
+        Crea un satélite hijo heredando parámetros con mutación.
+        
+        HEREDABILIDAD: El hijo hereda la calidad inherente del padre
+        (con mutación pequeña)
+        
+        Args:
+            tiempo_lanzamiento: datetime del lanzamiento del hijo
+            tasa_mutacion: tasa de mutación (0-1)
+            
+        Returns:
+            nuevo Satellite
+        """
+        # Heredar parámetros orbitales con mutación
+        mutacion = lambda x: x + np.random.normal(0, tasa_mutacion * x)
+        
+        a_hijo = mutacion(self.a)
+        e_hijo = np.clip(mutacion(self.e), 0.0, 0.3)
+        i_hijo = np.clip(mutacion(self.i), 0, 90)
+        Omega_hijo = mutacion(self.Omega) % 360
+        omega_hijo = mutacion(self.omega) % 360
+        M_hijo = np.random.uniform(0, 360)  # nuevo en órbita
+        
+        # =====================================================================
+        # HEREDABILIDAD DE CALIDAD: Hijo hereda robustez del padre
+        # =====================================================================
+        # Pequeña variación genética en calidad
+        calidad_hijo = self.calidad_inherente + np.random.normal(0, 0.03)
+        calidad_hijo = np.clip(calidad_hijo, 0.1, 1.0)
+        # Resultado: familias de satélites "buenos" o "malos"
+        
+        # El hijo hereda propiedades físicas
+        combustible_hijo = self.combustible * 0.9
+        energia_hijo = self.energia * 0.9
+        masa_hijo = self.masa_kg * np.random.uniform(0.9, 1.1)
+        
+        return Satellite(
+            a_hijo, e_hijo, i_hijo, Omega_hijo, omega_hijo, M_hijo,
+            tiempo_lanzamiento,
+            combustible=combustible_hijo,
+            energia=energia_hijo,
+            masa_kg=masa_hijo,
+            pariente_id=self.id,
+            calidad_inherente=calidad_hijo,  # Heredar calidad
+            config=self.config
+        )
+    
+    def info(self) -> Dict:
+        """Información completa del satélite."""
+        return {
+            'id': self.id,
+            'pariente_id': self.pariente_id,
+            'calidad_inherente': self.calidad_inherente,
+            'lambda_inherente': self.lambda_inherente,
+            'semieje_mayor_km': self.a,
+            'excentricidad': self.e,
+            'inclinacion_grados': self.i,
+            'altitud_km': self.altitud_km(),
+            'perigeo_km': self.distancia_perigeo(),
+            'apogeo_km': self.distancia_apogeo(),
+            'periodo_horas': self.periodo_orbital(),
+            'masa_kg': self.masa_kg,
+            'combustible': self.combustible,
+            'energia': self.energia,
+            'radiacion_acumulada': self.radiacion_acumulada,
+            'degradacion_orbital': self.degradacion_orbital,
+            'activo': self.activo,
+            'causa_muerte': self.causa_muerte
+        }
+
+
+# =============================================================================
+# DISTRIBUCIÓN DE FALLA MEJORADA
+# =============================================================================
+
+class DistribucionFalla:
+    """
+    Probabilidad de falla basada en condiciones.
+
+    Modelo legacy de tasa de falla única basada en una curva tipo
+    Weibull (envejecimiento) modificada por radiación y degradación
+    orbital. Se mantiene por compatibilidad y para configurar
+    `SimulacionSatelites`, pero el cálculo real de fallas usa el modelo
+    de tasas aditivas de :meth:`Satellite.calcular_lambda_total`.
+    """
+    
+    def __init__(self, tasa_base: float = 0.001, parametro_forma: float = 1.5,
+                 escala_tiempo: float = 3.0):
+        """
+        Args:
+            tasa_base: tasa de falla base para satélites recién lanzados.
+            parametro_forma: parámetro de forma de la curva Weibull
+                (k > 1 implica tasa de falla creciente con la edad).
+            escala_tiempo: escala de tiempo en años usada para normalizar
+                la curva de envejecimiento.
+        """
+        self.tasa_base = tasa_base
+        self.parametro_forma = parametro_forma
+        self.escala_tiempo = escala_tiempo
+    
+    def probabilidad_falla_diaria(self, edad_dias: float, 
+                                 radiacion: float = 0.0,
+                                 degradacion: float = 0.0) -> float:
+        """
+        Método legacy para compatibilidad.
+        NOTA: Este método está deprecado, usar calcular_lambda_total() en Satellite
+        
+        Args:
+            edad_dias: edad en días
+            radiacion: radiación acumulada (0-1)
+            degradacion: degradación orbital (0-1)
+            
+        Returns:
+            probabilidad de falla (0-1)
+        """
+        escala_dias = self.escala_tiempo * 365.25
+        
+        if edad_dias == 0:
+            tasa = self.tasa_base
+        else:
+            tasa = (self.parametro_forma / escala_dias) * \
+                   (edad_dias / escala_dias) ** (self.parametro_forma - 1)
+        
+        # Modificar por radiación y degradación
+        tasa *= (1.0 + radiacion * 2.0 + degradacion * 1.0)
+        
+        prob = 1 - np.exp(-tasa)
+        return min(prob, 1.0)
+
+
+# =============================================================================
+# SIMULACIÓN MEJORADA
+# =============================================================================
+
+class SimulacionSatelites:
+    """
+    Simulación evolutiva avanzada de satélites.
+
+    Orquesta el ciclo de vida completo de una población de satélites:
+    lanzamientos periódicos, efectos ambientales diarios, evaluación de
+    muertes y reproducción selectiva (heredabilidad). El historial de
+    estadísticas por día queda disponible en `self.historial` para su
+    posterior visualización (ver `visualizador.py`).
+
+    Attributes:
+        distribucion_falla: modelo legacy de tasa de falla (ver
+            :class:`DistribucionFalla`).
+        intervalo_lanzamiento: `timedelta` entre lanzamientos programados.
+        satelites_por_lanzamiento: cantidad de satélites por lanzamiento.
+        edad_maxima_dias: edad máxima operativa, en días.
+        tiempo_actual: fecha/hora actual de la simulación.
+        dias_transcurridos: contador de días simulados desde el inicio.
+        ciclo_solar, radiacion_cosmica, debris: subsistemas ambientales.
+        satelites_activos: lista de satélites actualmente operativos.
+        satelites_muertos: lista de satélites que dejaron de operar.
+        historial: lista de diccionarios con estadísticas por día.
+        reproductor_habilitado: si se permite la reproducción selectiva.
+        tasa_mutacion: tasa de mutación usada al crear satélites hijo.
+        satelites_reproducidos: contador total de satélites reproducidos.
+        causas_muerte_acumuladas: conteo acumulado de muertes por causa.
+        desorbitado_controlado_habilitado: si al llegar a la edad máxima
+            se intenta una maniobra de desorbitado controlado + pasivación
+            (mitigación de debris, "regla de los 25 años").
+        altitud_objetivo_desorbitado_km: altitud objetivo de la maniobra
+            de desorbitado controlado.
+        prob_explosion_no_pasivado: probabilidad de explosión/fragmentación
+            para un satélite que termina su misión sin pasivarse y con
+            combustible residual por encima de `combustible_umbral_riesgo`.
+        adr_habilitado: si se simula remoción activa de debris (ADR).
+        adr_tasa_remocion_anual: cantidad de objetos de debris removidos
+            por año cuando `adr_habilitado` es True.
+        costo_lanzamiento_unitario, costo_remocion_unitario: costos
+            (en unidades arbitrarias) usados para la métrica simple de
+            sostenibilidad económica.
+        satelites_pasivados: contador de satélites pasivados exitosamente.
+        debris_removido_total: total de debris removido por ADR.
+        costo_total_lanzamientos, costo_total_remocion: costos acumulados.
+    """
+    
+    def __init__(self, distribucion_falla: Optional[DistribucionFalla] = None,
+                 intervalo_lanzamiento_dias: int = 30,
+                 satelites_por_lanzamiento: int = 5,
+                 edad_maxima_anos: int = 5,
+                 tiempo_inicio: Optional[datetime] = None,
+                 reproductor_habilitado: bool = True,
+                 tasa_mutacion: float = 0.05,
+                 desorbitado_controlado_habilitado: bool = True,
+                 altitud_objetivo_desorbitado_km: float = 300.0,
+                 prob_explosion_no_pasivado: float = 0.1,
+                 combustible_umbral_riesgo: float = 10.0,
+                 adr_habilitado: bool = False,
+                 adr_tasa_remocion_anual: float = 0.0,
+                 costo_lanzamiento_unitario: float = 100.0,
+                 costo_remocion_unitario: float = 20.0,
+                 config: Optional[ConfiguracionFisica] = None):
+        """
+        Args:
+            distribucion_falla: modelo de falla
+            intervalo_lanzamiento_dias: días entre lanzamientos
+            satelites_por_lanzamiento: satélites por lanzamiento
+            edad_maxima_anos: edad máxima
+            tiempo_inicio: inicio simulación
+            reproductor_habilitado: si se permite reproducción selectiva
+            tasa_mutacion: tasa de mutación en heredabilidad
+            desorbitado_controlado_habilitado: si se intenta desorbitado
+                controlado + pasivación al fin de vida (regla de 25 años)
+            altitud_objetivo_desorbitado_km: altitud objetivo de la
+                maniobra de desorbitado controlado
+            prob_explosion_no_pasivado: probabilidad diaria de explosión
+                para satélites no pasivados con combustible residual
+            combustible_umbral_riesgo: umbral de combustible (%) por
+                encima del cual un satélite no pasivado puede explotar
+            adr_habilitado: si se simula remoción activa de debris (ADR)
+            adr_tasa_remocion_anual: objetos de debris removidos por año
+            costo_lanzamiento_unitario: costo (unidades arbitrarias) por
+                satélite lanzado, para la métrica de sostenibilidad
+            costo_remocion_unitario: costo (unidades arbitrarias) por
+                objeto de debris removido vía ADR
+            config: configuración física centralizada (ver
+                :class:`ConfiguracionFisica`) compartida por todos los
+                satélites y el sistema de debris; si es None, se usan
+                los valores por defecto.
+        """
+        self.config = config or ConfiguracionFisica()
+        self.distribucion_falla = distribucion_falla or DistribucionFalla()
+        self.intervalo_lanzamiento = timedelta(days=intervalo_lanzamiento_dias)
+        self.satelites_por_lanzamiento = satelites_por_lanzamiento
+        self.edad_maxima_dias = edad_maxima_anos * 365.25
+        
+        self.tiempo_actual = tiempo_inicio or datetime.now()
+        self.tiempo_proximo_lanzamiento = self.tiempo_actual
+        self.dias_transcurridos = 0.0
+        
+        # Sistemas ambientales
+        self.ciclo_solar = CicloSolar()
+        self.radiacion_cosmica = RadiacionCosmica()
+        self.debris = DebrisEspacial(config=self.config)
+        
+        # Población
+        self.satelites_activos: List[Satellite] = []
+        self.satelites_muertos: List[Satellite] = []
+        self.historial: List[Dict] = []
+        
+        # Reproducción
+        self.reproductor_habilitado = reproductor_habilitado
+        self.tasa_mutacion = tasa_mutacion
+        self.satelites_reproducidos = 0
+        
+        # Tracking de causas de muerte acumuladas (para visualización)
+        self.causas_muerte_acumuladas: Dict[str, int] = {}
+        
+        # Mitigación de debris: pasivación + desorbitado controlado
+        self.desorbitado_controlado_habilitado = desorbitado_controlado_habilitado
+        self.altitud_objetivo_desorbitado_km = altitud_objetivo_desorbitado_km
+        self.prob_explosion_no_pasivado = prob_explosion_no_pasivado
+        self.combustible_umbral_riesgo = combustible_umbral_riesgo
+        self.satelites_pasivados = 0
+        
+        # Remoción activa de debris (ADR)
+        self.adr_habilitado = adr_habilitado
+        self.adr_tasa_remocion_anual = adr_tasa_remocion_anual
+        self.debris_removido_total = 0.0
+        
+        # Dimensión económica simple (trade-offs de sostenibilidad)
+        self.costo_lanzamiento_unitario = costo_lanzamiento_unitario
+        self.costo_remocion_unitario = costo_remocion_unitario
+        self.costo_total_lanzamientos = 0.0
+        self.costo_total_remocion = 0.0
+    
+    def _registrar_causa_muerte(self, causa: Optional[str]):
+        """
+        Registra una muerte en el conteo acumulado por causa.
+
+        Args:
+            causa: nombre de la causa de muerte (o None, registrado
+                como "desconocida").
+        """
+        clave = causa or "desconocida"
+        self.causas_muerte_acumuladas[clave] = self.causas_muerte_acumuladas.get(clave, 0) + 1
+    
+    def _generar_parametros_kepleriano(self) -> Tuple[float, float, float, float, float, float]:
+        """
+        Genera parámetros keplerianos aleatorios para un nuevo satélite.
+
+        Returns:
+            Tupla (a, e, i, Omega, omega, M) con semieje mayor en km
+            (rango LEO 6600-7200) y ángulos en grados.
+        """
+        a = np.random.uniform(6600, 7200)
+        e = np.random.uniform(0.0, 0.02)
+        i = np.random.uniform(0, 90)
+        Omega = np.random.uniform(0, 360)
+        omega = np.random.uniform(0, 360)
+        M = np.random.uniform(0, 360)
+        return a, e, i, Omega, omega, M
+    
+    def lanzar_satelites(self, heredables: bool = False) -> List[Satellite]:
+        """
+        Lanza nuevos satélites.
+        
+        Args:
+            heredables: si los nuevos pueden reproducirse
+            
+        Returns:
+            lista de satélites lanzados
+        """
+        nuevos = []
+        
+        if heredables and self.reproductor_habilitado and self.satelites_activos:
+            # Reproducción selectiva: satélites sanos se reproducen
+            padres_candidatos = [s for s in self.satelites_activos 
+                               if s.energia > 50 and s.combustible > 30]
+            
+            if padres_candidatos:
+                for _ in range(min(self.satelites_por_lanzamiento, len(padres_candidatos))):
+                    padre = random.choice(padres_candidatos)
+                    hijo = padre.crear_hijo(self.tiempo_actual, self.tasa_mutacion)
+                    self.satelites_activos.append(hijo)
+                    nuevos.append(hijo)
+                    self.satelites_reproducidos += 1
+                    
+                    # Padre gasta combustible en "reproducción"
+                    padre.combustible -= 10
+        
+        # Completar con lanzamientos nuevos
+        faltantes = self.satelites_por_lanzamiento - len(nuevos)
+        for _ in range(faltantes):
+            a, e, i, Omega, omega, M = self._generar_parametros_kepleriano()
+            sat = Satellite(a, e, i, Omega, omega, M, self.tiempo_actual, config=self.config)
+            self.satelites_activos.append(sat)
+            nuevos.append(sat)
+        
+        # Costo económico de los lanzamientos (dimensión de sostenibilidad)
+        self.costo_total_lanzamientos += self.costo_lanzamiento_unitario * len(nuevos)
+        
+        self.tiempo_proximo_lanzamiento += self.intervalo_lanzamiento
+        return nuevos
+    
+    def evaluar_muertes(self):
+        """
+        Evalúa muertes por múltiples causas.
+
+        Recorre `satelites_activos` y marca como muertos (moviéndolos a
+        `satelites_muertos` y registrando la causa) a quienes:
+        1. Alcanzaron la edad máxima ("edad_maxima", "fin_mision_controlado"
+           o "explosion_fragmentacion", según si se intenta mitigación de
+           fin de vida, ver más abajo).
+        2. Fallan probabilísticamente según la tasa aditiva total
+           ("falla_componentes", ver
+           :meth:`Satellite.probabilidad_falla_diaria_aditiva`).
+        3. Colisionan con debris espacial ("colision_debris").
+
+        Al llegar a la edad máxima, si `desorbitado_controlado_habilitado`
+        está activo, se intenta una maniobra de desorbitado controlado
+        (:meth:`Satellite.intentar_desorbitado_controlado`) y una
+        pasivación (:meth:`Satellite.pasivar`, con probabilidad de éxito
+        igual a la calidad inherente del satélite). Un satélite que
+        cumple ambas se marca como "fin_mision_controlado"; uno que no
+        se pasiva y conserva combustible residual por encima de
+        `combustible_umbral_riesgo` puede sufrir "explosion_fragmentacion"
+        (con `prob_explosion_no_pasivado` de probabilidad), generando
+        varias veces más debris que un derelicto simple.
+
+        Cada muerte genera debris en la banda orbital correspondiente:
+        las colisiones y explosiones generan fragmentos proporcionales
+        a la energía involucrada (ver
+        :meth:`DebrisEspacial.generar_debris_por_colision` y
+        :meth:`DebrisEspacial.generar_debris_por_explosion`), mientras
+        que el resto de causas dejan al satélite mismo como un objeto
+        derelicto rastreable (ver
+        :meth:`DebrisEspacial.generar_debris_derelicto`). Al finalizar,
+        actualiza `satelites_activos` con los supervivientes.
+        """
+        satelites_supervivientes = []
+        
+        for sat in self.satelites_activos:
+            edad_dias = sat.edad_dias(self.tiempo_actual)
+            
+            # 1. Edad máxima (fin de vida): mitigación opcional de debris
+            if edad_dias >= self.edad_maxima_dias:
+                sat.activo = False
+                
+                maniobra_ok = True
+                if self.desorbitado_controlado_habilitado:
+                    maniobra_ok = sat.intentar_desorbitado_controlado(
+                        self.altitud_objetivo_desorbitado_km
+                    )
+                    if random.random() < sat.calidad_inherente:
+                        sat.pasivar()
+                        self.satelites_pasivados += 1
+                
+                if self.desorbitado_controlado_habilitado and maniobra_ok and sat.pasivado:
+                    sat.causa_muerte = "fin_mision_controlado"
+                elif (not sat.pasivado and sat.combustible > self.combustible_umbral_riesgo
+                      and random.random() < self.prob_explosion_no_pasivado):
+                    sat.causa_muerte = "explosion_fragmentacion"
+                else:
+                    sat.causa_muerte = "edad_maxima"
+                
+                self.satelites_muertos.append(sat)
+                self._registrar_causa_muerte(sat.causa_muerte)
+                
+                if sat.causa_muerte == "explosion_fragmentacion":
+                    self.debris.generar_debris_por_explosion(
+                        sat.altitud_km(), sat.masa_kg, sat.combustible / 100.0
+                    )
+                else:
+                    self.debris.generar_debris_derelicto(sat.altitud_km())
+                continue
+            
+            # 2. Falla probabilística (tasas aditivas)
+            prob_falla = sat.probabilidad_falla_diaria_aditiva(
+                edad_dias, 
+                self.debris.probabilidad_colision(sat.altitud_km()),
+                self.ciclo_solar
+            )
+            if random.random() < prob_falla:
+                sat.activo = False
+                sat.causa_muerte = "falla_componentes"
+                self.satelites_muertos.append(sat)
+                self._registrar_causa_muerte(sat.causa_muerte)
+                self.debris.generar_debris_derelicto(sat.altitud_km())
+                continue
+            
+            # 3. Colisión con debris
+            prob_colision = self.debris.probabilidad_colision(sat.altitud_km())
+            if random.random() < prob_colision:
+                sat.activo = False
+                sat.causa_muerte = "colision_debris"
+                self.satelites_muertos.append(sat)
+                self._registrar_causa_muerte(sat.causa_muerte)
+                self.debris.colisiones_totales += 1
+                self.debris.generar_debris_por_colision(
+                    sat.altitud_km(), sat.masa_kg, sat.velocidad_orbital_kms()
+                )
+                continue
+            
+            # Superviviente
+            satelites_supervivientes.append(sat)
+        
+        self.satelites_activos = satelites_supervivientes
+    
+    def actualizar_sistemas_ambientales(self):
+        """
+        Aplica efectos ambientales a satélites activos.
+
+        Para cada satélite activo aplica, en orden: drag atmosférico
+        (posible reentrada), presión de radiación solar, radiación
+        cósmica (posible falla por radiación) y consumo/recarga de
+        energía (posible falla por falta de energía). Los satélites que
+        dejan de estar activos se mueven a `satelites_muertos`, su causa
+        de muerte se registra en el conteo acumulado y el satélite
+        derelicto pasa a formar parte del debris de su banda orbital.
+        """
+        for sat in self.satelites_activos:
+            # Drag atmosférico y reentrada
+            sat.aplicar_drag_atmosferico(self.ciclo_solar, self.dias_transcurridos)
+            
+            if not sat.activo:  # Reentrada
+                self.satelites_muertos.append(sat)
+                self._registrar_causa_muerte(sat.causa_muerte)
+                self.debris.generar_debris_derelicto(sat.altitud_km())
+                continue
+            
+            # Presión de radiación solar
+            sat.aplicar_presion_radiacion_solar(self.ciclo_solar, self.dias_transcurridos)
+            
+            # Radiación cósmica
+            sat.aplicar_radiacion_cosmica(self.radiacion_cosmica)
+            
+            if not sat.activo:  # Muerte por radiación
+                self.satelites_muertos.append(sat)
+                self._registrar_causa_muerte(sat.causa_muerte)
+                self.debris.generar_debris_derelicto(sat.altitud_km())
+            
+            # Metabolismo: consumo de energía
+            if sat.activo:
+                sat.recargar_energia(10.0)  # ganancia de luz solar
+                if not sat.consumir_energia():  # consume energía
+                    self.satelites_muertos.append(sat)
+                    self._registrar_causa_muerte(sat.causa_muerte)
+                    self.debris.generar_debris_derelicto(sat.altitud_km())
+        
+        # Limpiar muertos del activos
+        self.satelites_activos = [s for s in self.satelites_activos if s.activo]
+    
+    def paso_tiempo(self, dias: int = 1) -> Dict:
+        """
+        Avanza simulación varios días.
+
+        Por cada día: aplica efectos ambientales, evalúa muertes
+        naturales/colisiones y, si corresponde, lanza nuevos satélites
+        (alternando entre lanzamientos nuevos y reproducción selectiva).
+        Al final registra un snapshot de estadísticas en `self.historial`.
+
+        Args:
+            dias: cantidad de días a avanzar en esta llamada.
+
+        Returns:
+            Diccionario con las estadísticas del último día simulado
+            (también agregado a `self.historial`).
+        """
+        for _ in range(dias):
+            self.tiempo_actual += timedelta(days=1)
+            self.dias_transcurridos += 1
+            
+            # Aplicar efectos ambientales
+            self.actualizar_sistemas_ambientales()
+            
+            # Evaluar muertes naturales/colisiones
+            self.evaluar_muertes()
+            
+            # Decaimiento natural del debris + riesgo de cascada del día
+            riesgo_cascada = self.debris.aplicar_decaimiento_diario()
+            
+            # Remoción activa de debris (ADR), si está habilitada
+            if self.adr_habilitado and self.adr_tasa_remocion_anual > 0:
+                cantidad_diaria = self.adr_tasa_remocion_anual / 365.25
+                removido = self.debris.remover_debris(cantidad_diaria)
+                self.debris_removido_total += removido
+                self.costo_total_remocion += removido * self.costo_remocion_unitario
+            
+            # Lanzar nuevos satélites si es tiempo
+            nuevos = []
+            if self.tiempo_actual >= self.tiempo_proximo_lanzamiento:
+                # Alternar entre lanzamientos nuevos y reproducción
+                heredables = (len(self.satelites_muertos) % 100) < 50
+                nuevos = self.lanzar_satelites(heredables=heredables)
+        
+        stats = {
+            'tiempo': self.tiempo_actual,
+            'dias': int(self.dias_transcurridos),
+            'satelites_activos': len(self.satelites_activos),
+            'satelites_muertos': len(self.satelites_muertos),
+            'nuevos_lanzados': len(nuevos),
+            'reproducidos': self.satelites_reproducidos,
+            'actividad_solar': float(self.ciclo_solar.actividad_solar(self.dias_transcurridos)),
+            'densidad_debris': float(self.debris.densidad_normalizada()),
+            'densidad_debris_por_banda': {
+                banda: float(self.debris.densidad_normalizada_banda(banda))
+                for banda in self.debris.densidad_por_banda
+            },
+            'riesgo_cascada': riesgo_cascada,
+            'colisiones_totales': self.debris.colisiones_totales,
+            'edad_promedio_dias': self._edad_promedio() if self.satelites_activos else 0,
+            'energia_promedio': self._energia_promedio() if self.satelites_activos else 0,
+            'radiacion_promedio': self._radiacion_promedio() if self.satelites_activos else 0,
+            'semieje_mayor_promedio': self._semieje_promedio() if self.satelites_activos else 0,
+            'calidad_promedio': self._calidad_promedio() if self.satelites_activos else 0,
+            'causas_muerte_acumuladas': dict(self.causas_muerte_acumuladas),
+            'satelites_pasivados': self.satelites_pasivados,
+            'debris_removido_total': float(self.debris_removido_total),
+            'costo_total_lanzamientos': float(self.costo_total_lanzamientos),
+            'costo_total_remocion': float(self.costo_total_remocion),
+            'costo_total_sostenibilidad': float(self.costo_total_lanzamientos + self.costo_total_remocion),
+        }
+        
+        self.historial.append(stats)
+        return stats
+    
+    def _edad_promedio(self) -> float:
+        """Edad promedio (en días) de los satélites activos."""
+        if not self.satelites_activos:
+            return 0
+        edades = [sat.edad_dias(self.tiempo_actual) for sat in self.satelites_activos]
+        return float(np.mean(edades))
+    
+    def _energia_promedio(self) -> float:
+        """Energía promedio (%) de los satélites activos."""
+        if not self.satelites_activos:
+            return 0
+        return float(np.mean([sat.energia for sat in self.satelites_activos]))
+    
+    def _radiacion_promedio(self) -> float:
+        """Radiación cósmica acumulada promedio (0-1) de los satélites activos."""
+        if not self.satelites_activos:
+            return 0
+        return float(np.mean([sat.radiacion_acumulada for sat in self.satelites_activos]))
+    
+    def _semieje_promedio(self) -> float:
+        """Semieje mayor promedio (km) de los satélites activos."""
+        if not self.satelites_activos:
+            return 0
+        return float(np.mean([sat.a for sat in self.satelites_activos]))
+    
+    def _calidad_promedio(self) -> float:
+        """Calidad inherente promedio (0-1) de los satélites activos."""
+        if not self.satelites_activos:
+            return 0
+        return float(np.mean([sat.calidad_inherente for sat in self.satelites_activos]))
+    
+    def ejecutar_simulacion(self, dias_totales: int = 1825) -> List[Dict]:
+        """
+        Ejecuta simulación completa.
+
+        Avanza la simulación día a día hasta `dias_totales`, imprimiendo
+        un resumen de progreso cada 365 días.
+
+        Args:
+            dias_totales: cantidad total de días a simular (por defecto
+                1825 días = 5 años).
+
+        Returns:
+            Historial completo de estadísticas por día (`self.historial`).
+        """
+        print(f"Iniciando simulación avanzada por {dias_totales} días...")
+        print(f"  - Ciclos solares: Habilitados")
+        print(f"  - Debris espacial: Habilitado")
+        print(f"  - Radiación cósmica: Habilitada")
+        print(f"  - Heredabilidad: {'Habilitada' if self.reproductor_habilitado else 'Deshabilitada'}")
+        print(f"Tiempo inicial: {self.tiempo_actual}\n")
+        
+        for i in range(dias_totales):
+            self.paso_tiempo(1)
+            if (i + 1) % 365 == 0:
+                print(f"Año {(i+1)//365}: {len(self.satelites_activos)} activos, "
+                      f"{len(self.satelites_muertos)} muertos, "
+                      f"Debris: {self.debris.densidad:.0f}")
+        
+        print(f"\nSimulación completada. Tiempo final: {self.tiempo_actual}")
+        return self.historial
+    
+    def obtener_estadisticas_finales(self) -> Dict:
+        """
+        Estadísticas finales detalladas.
+
+        Returns:
+            Diccionario con totales de satélites lanzados/activos/muertos,
+            reproducidos, causas de muerte agregadas, estado del debris
+            y promedios finales (edad, energía, radiación, semieje mayor).
+        """
+        total_lanzados = len(self.satelites_activos) + len(self.satelites_muertos)
+        
+        causas_muerte = {}
+        for s in self.satelites_muertos:
+            causa = s.causa_muerte or "desconocida"
+            causas_muerte[causa] = causas_muerte.get(causa, 0) + 1
+        
+        return {
+            'tiempo_simulacion': str(self.tiempo_actual),
+            'dias_totales': int(self.dias_transcurridos),
+            'satelites_activos_finales': len(self.satelites_activos),
+            'satelites_muertos_totales': len(self.satelites_muertos),
+            'satelites_lanzados_totales': total_lanzados,
+            'satelites_reproducidos': self.satelites_reproducidos,
+            'causas_muerte': causas_muerte,
+            'debris_final': int(self.debris.densidad),
+            'debris_por_banda_final': {
+                banda: round(cantidad, 1) for banda, cantidad in self.debris.densidad_por_banda.items()
+            },
+            'colisiones_totales': self.debris.colisiones_totales,
+            'edad_promedio_activos_dias': self._edad_promedio(),
+            'energia_promedio': self._energia_promedio(),
+            'radiacion_promedio': self._radiacion_promedio(),
+            'semieje_mayor_promedio_km': self._semieje_promedio(),
+            'satelites_pasivados': self.satelites_pasivados,
+            'debris_removido_total_adr': round(self.debris_removido_total, 1),
+            'costo_total_lanzamientos': round(self.costo_total_lanzamientos, 2),
+            'costo_total_remocion': round(self.costo_total_remocion, 2),
+            'costo_total_sostenibilidad': round(self.costo_total_lanzamientos + self.costo_total_remocion, 2),
+        }
+    
+    def listar_satelites_activos(self, limite: int = 10) -> List[Dict]:
+        """
+        Lista satélites activos con info completa.
+
+        Args:
+            limite: cantidad máxima de satélites a incluir.
+
+        Returns:
+            Lista de diccionarios (ver :meth:`Satellite.info`) con los
+            primeros `limite` satélites activos.
+        """
+        return [sat.info() for sat in self.satelites_activos[:limite]]
+
+
+# =============================================================================
+# EJEMPLO DE USO
+# =============================================================================
+
+if __name__ == "__main__":
+    falla = DistribucionFalla(
+        tasa_base=0.0003,
+        parametro_forma=2.0,
+        escala_tiempo=3.0
+    )
+    
+    sim = SimulacionSatelites(
+        distribucion_falla=falla,
+        intervalo_lanzamiento_dias=30,
+        satelites_por_lanzamiento=5,
+        edad_maxima_anos=5,
+        tiempo_inicio=datetime(2024, 1, 1),
+        reproductor_habilitado=True,
+        tasa_mutacion=0.05
+    )
+    
+    sim.lanzar_satelites()
+    historial = sim.ejecutar_simulacion(dias_totales=1825)
+    
+    print("\n" + "="*70)
+    print("ESTADÍSTICAS FINALES - SIMULACIÓN AVANZADA")
+    print("="*70)
+    stats = sim.obtener_estadisticas_finales()
+    for clave, valor in stats.items():
+        print(f"{clave:.<45} {valor}")
+    
+    print("\n" + "="*70)
+    print("SATÉLITES ACTIVOS (muestra)")
+    print("="*70)
+    activos = sim.listar_satelites_activos(limite=5)
+    for sat in activos:
+        print(f"\nSAT-{sat['id']} (padre: SAT-{sat['pariente_id']})")
+        print(f"  Calidad: {sat['calidad_inherente']:.2f} | λ_inherente: {sat['lambda_inherente']:.6f}/día")
+        print(f"  Altitud: {sat['altitud_km']:.0f} km | Energía: {sat['energia']:.1f}%")
+        print(f"  Combustible: {sat['combustible']:.1f}% | Radiación: {sat['radiacion_acumulada']:.3f}")
+        print(f"  Masa: {sat['masa_kg']:.1f} kg | Degradación: {sat['degradacion_orbital']:.4f}")
