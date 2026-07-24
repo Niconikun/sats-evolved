@@ -36,18 +36,37 @@ Unidades: las distancias orbitales (a, altitud, perigeo, apogeo) están
 en kilómetros, los ángulos (i, Omega, omega, M) en grados, el tiempo en
 días y las magnitudes de calidad/energía/combustible/radiación están
 normalizadas entre 0 y 1 (o 0-100 para energía/combustible en "%").
+from enum import Enum, auto
 """
 
 import numpy as np
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
+from enum import Enum, auto
 import random
 from scipy.stats import weibull_min, lognorm
 
 # Constante gravitacional terrestre estándar (GM), en km^3/s^2
 GM_TIERRA_KM3_S2 = 398600.4
 RADIO_TIERRA_KM = 6371.0
+
+# =============================================================================
+# ENUMERACIONES
+# =============================================================================
+
+class CausaMuerte(Enum):
+    """Enumeración de posibles causas de muerte de un satélite."""
+    FALLA_COMPONENTES = auto()
+    COLISION_DEBRIS = auto()
+    REENTRADA_ORBITAL = auto()
+    RADIACION_COSMICA = auto()
+    FALTA_ENERGIA = auto()
+    EDAD_MAXIMA = auto()
+    FIN_MISION_CONTROLADO = auto()
+    EXPLOSION_FRAGMENTACION = auto()
+    DESCONOCIDA = auto()
+
 
 
 # =============================================================================
@@ -603,13 +622,23 @@ class Satellite:
         # Estado
         self.tiempo_lanzamiento = tiempo_lanzamiento
         self.activo = True
-        self.causa_muerte: Optional[str] = None
+        self.causa_muerte: Optional[CausaMuerte] = None
         self.pariente_id = pariente_id  # heredabilidad
         
         # Mitigación de debris: si el satélite fue pasivado (purga de
         # combustible/batería residual) al fin de su misión.
         self.pasivado = False
     
+        # Cachear parámetros para calcular_lambda_total (evitar recálculos)
+        self._escala_envejecimiento_dias = self.config.escala_envejecimiento_anos * 365.25
+        self._k_forma = self.config.forma_envejecimiento_k
+        self._factor_lambda_radiacion = self.config.factor_lambda_radiacion
+        self._factor_lambda_debris = self.config.factor_lambda_debris
+        self._umbral_energia = self.config.umbral_energia_baja_pct
+        self._factor_lambda_energia = self.config.factor_lambda_energia
+        self._umbral_combustible = self.config.umbral_combustible_bajo_pct
+        self._lambda_combustible_bajo = self.config.lambda_combustible_bajo
+
     def edad_dias(self, tiempo_actual: datetime) -> float:
         """Calcula edad en días."""
         return (tiempo_actual - self.tiempo_lanzamiento).total_seconds() / (24 * 3600)
@@ -850,68 +879,50 @@ class Satellite:
     # CÁLCULO DE TASAS ADITIVAS DE FALLA
     # =========================================================================
     
-    def calcular_lambda_total(self, edad_dias: float, 
-                             riesgo_debris: float,
-                             ciclo_solar: 'CicloSolar') -> float:
+    def calcular_lambda_total(self, edad_dias: float,
+                         riesgo_debris: float,
+                         ciclo_solar: 'CicloSolar') -> float:
         """
         Calcula tasa total de falla como SUMA de mecanismos independientes.
-        
+
         Cada mecanismo contribuye con su propia tasa:
-        λ_total = λ_inherente + λ_envejecimiento + λ_radiación + 
+        λ_total = λ_inherente + λ_envejecimiento + λ_radiación +
                   λ_debris + λ_energía + λ_combustible
-        
+
         Args:
-            edad_dias: edad en días
-            riesgo_debris: probabilidad base de colisión (0-1)
-            ciclo_solar: instancia de CicloSolar
-            
+            edad_dias: edad en días.
+            riesgo_debris: probabilidad base de colisión (0-1).
+            ciclo_solar: instancia de CicloSolar (no usada directamente aquí,
+                         pero se mantiene por compatibilidad).
+
         Returns:
-            tasa de falla total (en unidades de fallos por día)
+            float: tasa de falla total (en unidades de fallos por día).
         """
-        
         # 1. λ_INHERENTE: Constante para cada satélite (su "genética")
-        lambda_inherente = self.lambda_inherente
-        
+        lambda_total = self.lambda_inherente
+
         # 2. λ_ENVEJECIMIENTO: Curva de bañera Weibull
-        # Baja al inicio (rodaje), sube con edad (wear-out)
-        escala_dias = self.config.escala_envejecimiento_anos * 365.25  # años en días
-        k_forma = self.config.forma_envejecimiento_k  # parámetro de forma
-        
-        if edad_dias == 0:
-            lambda_envejecimiento = 0
-        else:
-            lambda_envejecimiento = (k_forma / escala_dias) * \
-                                   (edad_dias / escala_dias) ** (k_forma - 1)
-        
-        # 3. λ_RADIACIÓN: Acumula daño con el tiempo
-        # Mayor exposición = más daño acumulado
-        lambda_radiacion = self.radiacion_acumulada * self.config.factor_lambda_radiacion
-        
+        if edad_dias > 0:
+            lambda_total += (self._k_forma / self._escala_envejecimiento_dias) * (
+                edad_dias / self._escala_envejecimiento_dias
+            ) ** (self._k_forma - 1)
+
+        # 3. λ_RADIACIÓN: Daño acumulado
+        lambda_total += self.radiacion_acumulada * self._factor_lambda_radiacion
+
         # 4. λ_DEBRIS: Riesgo de colisión (ambiental)
-        lambda_debris = riesgo_debris * self.config.factor_lambda_debris
-        
+        lambda_total += riesgo_debris * self._factor_lambda_debris
+
         # 5. λ_ENERGÍA: Si batería baja, sistemas fallan
-        # Feedback metabolismo: energía baja = más fallos
-        umbral_energia = self.config.umbral_energia_baja_pct
-        if self.energia < umbral_energia:
-            lambda_energia = (umbral_energia - self.energia) * self.config.factor_lambda_energia
-        else:
-            lambda_energia = 0
-        
+        if self.energia < self._umbral_energia:
+            lambda_total += (self._umbral_energia - self.energia) * self._factor_lambda_energia
+
         # 6. λ_COMBUSTIBLE: Sin combustible no puede maniobrar
-        # No puede evitar debris o ajustar órbita
-        if self.combustible < self.config.umbral_combustible_bajo_pct:
-            lambda_combustible = self.config.lambda_combustible_bajo
-        else:
-            lambda_combustible = 0
-        
-        # SUMA TOTAL DE TASAS
-        lambda_total = (lambda_inherente + lambda_envejecimiento + 
-                       lambda_radiacion + lambda_debris + 
-                       lambda_energia + lambda_combustible)
-        
+        if self.combustible < self._umbral_combustible:
+            lambda_total += self._lambda_combustible_bajo
+
         return lambda_total
-    
+
     def probabilidad_falla_diaria_aditiva(self, edad_dias: float,
                                          riesgo_debris: float,
                                          ciclo_solar: 'CicloSolar') -> float:
@@ -1000,7 +1011,7 @@ class Satellite:
             'radiacion_acumulada': self.radiacion_acumulada,
             'degradacion_orbital': self.degradacion_orbital,
             'activo': self.activo,
-            'causa_muerte': self.causa_muerte
+            'causa_muerte': self.causa_muerte.name if self.causa_muerte else None
         }
 
 
@@ -1202,15 +1213,14 @@ class SimulacionSatelites:
         self.costo_total_lanzamientos = 0.0
         self.costo_total_remocion = 0.0
     
-    def _registrar_causa_muerte(self, causa: Optional[str]):
+    def _registrar_causa_muerte(self, causa: Optional[CausaMuerte]):
         """
         Registra una muerte en el conteo acumulado por causa.
 
         Args:
-            causa: nombre de la causa de muerte (o None, registrado
-                como "desconocida").
+            causa: Causa de muerte (Enum) o None (registrado como "desconocida").
         """
-        clave = causa or "desconocida"
+        clave = causa.name if causa else "desconocida"
         self.causas_muerte_acumuladas[clave] = self.causas_muerte_acumuladas.get(clave, 0) + 1
     
     def _generar_parametros_kepleriano(self) -> Tuple[float, float, float, float, float, float]:
@@ -1325,12 +1335,12 @@ class SimulacionSatelites:
                         self.satelites_pasivados += 1
                 
                 if self.desorbitado_controlado_habilitado and maniobra_ok and sat.pasivado:
-                    sat.causa_muerte = "fin_mision_controlado"
+                    sat.causa_muerte = CausaMuerte.FIN_MISION_CONTROLADO
                 elif (not sat.pasivado and sat.combustible > self.combustible_umbral_riesgo
                       and random.random() < self.prob_explosion_no_pasivado):
-                    sat.causa_muerte = "explosion_fragmentacion"
+                    sat.causa_muerte = CausaMuerte.EXPLOSION_FRAGMENTACION
                 else:
-                    sat.causa_muerte = "edad_maxima"
+                    sat.causa_muerte = CausaMuerte.EDAD_MAXIMA
                 
                 self.satelites_muertos.append(sat)
                 self._registrar_causa_muerte(sat.causa_muerte)
@@ -1351,7 +1361,7 @@ class SimulacionSatelites:
             )
             if random.random() < prob_falla:
                 sat.activo = False
-                sat.causa_muerte = "falla_componentes"
+                sat.causa_muerte = CausaMuerte.FALLA_COMPONENTES
                 self.satelites_muertos.append(sat)
                 self._registrar_causa_muerte(sat.causa_muerte)
                 self.debris.generar_debris_derelicto(sat.altitud_km())
@@ -1361,7 +1371,7 @@ class SimulacionSatelites:
             prob_colision = self.debris.probabilidad_colision(sat.altitud_km())
             if random.random() < prob_colision:
                 sat.activo = False
-                sat.causa_muerte = "colision_debris"
+                sat.causa_muerte = CausaMuerte.COLISION_DEBRIS
                 self.satelites_muertos.append(sat)
                 self._registrar_causa_muerte(sat.causa_muerte)
                 self.debris.colisiones_totales += 1
@@ -1568,7 +1578,7 @@ class SimulacionSatelites:
         
         causas_muerte = {}
         for s in self.satelites_muertos:
-            causa = s.causa_muerte or "desconocida"
+            causa = s.causa_muerte.name if s.causa_muerte else "desconocida"
             causas_muerte[causa] = causas_muerte.get(causa, 0) + 1
         
         return {
