@@ -30,7 +30,6 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 from datetime import datetime
 from typing import List, Dict, Optional
-import json
 
 from sat import SimulacionSatelites, Satellite, DistribucionFalla
 
@@ -468,89 +467,95 @@ class VisualizadorSatelites:
         
         # Colores para los satélites
         colores = px.colors.qualitative.Plotly
-        
-        # Agregar órbitas y satélites
-        for idx, sat in enumerate(satelites_a_mostrar):
-            color = colores[idx % len(colores)]
-            
-            # Generar puntos de la órbita (elipse Kepleriana simplificada)
-            nu = np.linspace(0, 2*np.pi, 200)  # anomalía verdadera
-            
-            # Coordenadas en plano orbital
-            r = sat.a * (1 - sat.e**2) / (1 + sat.e * np.cos(nu))
+
+        n_sats = len(satelites_a_mostrar)
+
+        if n_sats > 0:
+            # Parámetros orbitales de toda la población a graficar, como
+            # arrays de NumPy (en vez de recalcular senos/cosenos y
+            # matrices de rotación satélite por satélite en el loop).
+            a_arr = np.array([sat.a for sat in satelites_a_mostrar])
+            e_arr = np.array([sat.e for sat in satelites_a_mostrar])
+            M_arr = np.radians([sat.M for sat in satelites_a_mostrar])
+            omega_arr = np.radians([sat.omega for sat in satelites_a_mostrar])
+            Omega_arr = np.radians([sat.Omega for sat in satelites_a_mostrar])
+            i_arr = np.radians([sat.i for sat in satelites_a_mostrar])
+
+            cos_om, sin_om = np.cos(omega_arr)[:, None], np.sin(omega_arr)[:, None]
+            cos_Om, sin_Om = np.cos(Omega_arr)[:, None], np.sin(Omega_arr)[:, None]
+            cos_i, sin_i = np.cos(i_arr)[:, None], np.sin(i_arr)[:, None]
+
+            # Puntos de la órbita (elipse Kepleriana simplificada) de todos
+            # los satélites a la vez: filas = satélites, columnas = puntos
+            # a lo largo de la anomalía verdadera `nu`.
+            nu = np.linspace(0, 2 * np.pi, 200)[None, :]  # anomalía verdadera
+            r = a_arr[:, None] * (1 - e_arr[:, None] ** 2) / (1 + e_arr[:, None] * np.cos(nu))
             x_orb = r * np.cos(nu)
             y_orb = r * np.sin(nu)
-            z_orb = np.zeros_like(x_orb)
-            
-            # Rotaciones de Euler (simplificadas)
-            omega_rad = np.radians(sat.omega)
-            Omega_rad = np.radians(sat.Omega)
-            i_rad = np.radians(sat.i)
-            
-            # Matriz de rotación
-            x_rot = (x_orb * (np.cos(omega_rad)*np.cos(Omega_rad) - 
-                             np.sin(omega_rad)*np.cos(i_rad)*np.sin(Omega_rad)) -
-                    y_orb * (np.sin(omega_rad)*np.cos(Omega_rad) + 
-                             np.cos(omega_rad)*np.cos(i_rad)*np.sin(Omega_rad)))
-            
-            y_rot = (x_orb * (np.cos(omega_rad)*np.sin(Omega_rad) + 
-                             np.sin(omega_rad)*np.cos(i_rad)*np.cos(Omega_rad)) +
-                    y_orb * (-np.sin(omega_rad)*np.sin(Omega_rad) + 
-                             np.cos(omega_rad)*np.cos(i_rad)*np.cos(Omega_rad)))
-            
-            z_rot = (x_orb * np.sin(omega_rad)*np.sin(i_rad) + 
-                    y_orb * np.cos(omega_rad)*np.sin(i_rad))
-            
-            # Agregar órbita (línea)
-            fig.add_trace(go.Scatter3d(
-                x=x_rot, y=y_rot, z=z_rot,
-                mode='lines',
-                line=dict(color=color, width=2),
-                name=f'Órbita SAT-{sat.id}',
-                hovertemplate='SAT-{}<br>x: %{{x:.0f}} km<br>y: %{{y:.0f}} km<br>z: %{{z:.0f}} km<extra></extra>'.format(sat.id),
-                visible=True
-            ))
-            
-            # Agregar satélite (punto actual)
-            # Usar anomalía media como posición actual
-            M_rad = np.radians(sat.M)
-            r_sat = sat.a * (1 - sat.e**2) / (1 + sat.e * np.cos(M_rad))
-            x_sat_orb = r_sat * np.cos(M_rad)
-            y_sat_orb = r_sat * np.sin(M_rad)
-            z_sat_orb = 0
-            
-            x_sat = (x_sat_orb * (np.cos(omega_rad)*np.cos(Omega_rad) - 
-                                 np.sin(omega_rad)*np.cos(i_rad)*np.sin(Omega_rad)) -
-                    y_sat_orb * (np.sin(omega_rad)*np.cos(Omega_rad) + 
-                                 np.cos(omega_rad)*np.cos(i_rad)*np.sin(Omega_rad)))
-            
-            y_sat = (x_sat_orb * (np.cos(omega_rad)*np.sin(Omega_rad) + 
-                                 np.sin(omega_rad)*np.cos(i_rad)*np.cos(Omega_rad)) +
-                    y_sat_orb * (-np.sin(omega_rad)*np.sin(Omega_rad) + 
-                                 np.cos(omega_rad)*np.cos(i_rad)*np.cos(Omega_rad)))
-            
-            z_sat = (x_sat_orb * np.sin(omega_rad)*np.sin(i_rad) + 
-                    y_sat_orb * np.cos(omega_rad)*np.sin(i_rad))
-            
-            info_sat = sat.info()
-            fig.add_trace(go.Scatter3d(
-                x=[x_sat], y=[y_sat], z=[z_sat],
-                mode='markers+text',
-                marker=dict(size=8, color=color),
-                text=[f'SAT-{sat.id}'],
-                textposition='top center',
-                name=f'SAT-{sat.id}',
-                hovertemplate=(
-                    f'SAT-{sat.id}<br>'
-                    f'Calidad inherente: {info_sat["calidad_inherente"]:.2f}<br>'
-                    f'a: {info_sat["semieje_mayor_km"]:.1f} km<br>'
-                    f'e: {info_sat["excentricidad"]:.4f}<br>'
-                    f'i: {info_sat["inclinacion_grados"]:.1f}°<br>'
-                    f'Perigeo: {info_sat["perigeo_km"]:.1f} km<br>'
-                    f'Apogeo: {info_sat["apogeo_km"]:.1f} km<extra></extra>'
-                ),
-                visible=True
-            ))
+
+            # Rotación de Euler (matriz orbital → ECI), vectorizada sobre
+            # toda la población con broadcasting (cos_om, etc. tienen shape
+            # (n_sats, 1), x_orb/y_orb tienen shape (n_sats, n_puntos)).
+            x_rot_todos = (x_orb * (cos_om * cos_Om - sin_om * cos_i * sin_Om) -
+                          y_orb * (sin_om * cos_Om + cos_om * cos_i * sin_Om))
+            y_rot_todos = (x_orb * (cos_om * sin_Om + sin_om * cos_i * cos_Om) +
+                          y_orb * (-sin_om * sin_Om + cos_om * cos_i * cos_Om))
+            z_rot_todos = x_orb * sin_om * sin_i + y_orb * cos_om * sin_i
+
+            # Posición actual del satélite (anomalía media como proxy),
+            # mismo esquema de rotación vectorizado.
+            r_sat = a_arr * (1 - e_arr ** 2) / (1 + e_arr * np.cos(M_arr))
+            x_sat_orb = r_sat * np.cos(M_arr)
+            y_sat_orb = r_sat * np.sin(M_arr)
+
+            cos_om_1d, sin_om_1d = cos_om[:, 0], sin_om[:, 0]
+            cos_Om_1d, sin_Om_1d = cos_Om[:, 0], sin_Om[:, 0]
+            cos_i_1d, sin_i_1d = cos_i[:, 0], sin_i[:, 0]
+
+            x_sat_todos = (x_sat_orb * (cos_om_1d * cos_Om_1d - sin_om_1d * cos_i_1d * sin_Om_1d) -
+                          y_sat_orb * (sin_om_1d * cos_Om_1d + cos_om_1d * cos_i_1d * sin_Om_1d))
+            y_sat_todos = (x_sat_orb * (cos_om_1d * sin_Om_1d + sin_om_1d * cos_i_1d * cos_Om_1d) +
+                          y_sat_orb * (-sin_om_1d * sin_Om_1d + cos_om_1d * cos_i_1d * cos_Om_1d))
+            z_sat_todos = x_sat_orb * sin_om_1d * sin_i_1d + y_sat_orb * cos_om_1d * sin_i_1d
+
+            # Agregar órbitas y satélites (el loop solo arma las trazas de
+            # Plotly; toda la trigonometría/rotación ya se calculó arriba en
+            # una sola pasada vectorizada para los `n_sats` satélites).
+            for idx, sat in enumerate(satelites_a_mostrar):
+                color = colores[idx % len(colores)]
+
+                x_rot, y_rot, z_rot = x_rot_todos[idx], y_rot_todos[idx], z_rot_todos[idx]
+                x_sat, y_sat, z_sat = x_sat_todos[idx], y_sat_todos[idx], z_sat_todos[idx]
+                
+                # Agregar órbita (línea)
+                fig.add_trace(go.Scatter3d(
+                    x=x_rot, y=y_rot, z=z_rot,
+                    mode='lines',
+                    line=dict(color=color, width=2),
+                    name=f'Órbita SAT-{sat.id}',
+                    hovertemplate='SAT-{}<br>x: %{{x:.0f}} km<br>y: %{{y:.0f}} km<br>z: %{{z:.0f}} km<extra></extra>'.format(sat.id),
+                    visible=True
+                ))
+                
+                info_sat = sat.info()
+                fig.add_trace(go.Scatter3d(
+                    x=[x_sat], y=[y_sat], z=[z_sat],
+                    mode='markers+text',
+                    marker=dict(size=8, color=color),
+                    text=[f'SAT-{sat.id}'],
+                    textposition='top center',
+                    name=f'SAT-{sat.id}',
+                    hovertemplate=(
+                        f'SAT-{sat.id}<br>'
+                        f'Calidad inherente: {info_sat["calidad_inherente"]:.2f}<br>'
+                        f'a: {info_sat["semieje_mayor_km"]:.1f} km<br>'
+                        f'e: {info_sat["excentricidad"]:.4f}<br>'
+                        f'i: {info_sat["inclinacion_grados"]:.1f}°<br>'
+                        f'Perigeo: {info_sat["perigeo_km"]:.1f} km<br>'
+                        f'Apogeo: {info_sat["apogeo_km"]:.1f} km<extra></extra>'
+                    ),
+                    visible=True
+                ))
         
         # Actualizar layout
         fig.update_layout(
