@@ -280,6 +280,30 @@ python -m pytest tests/ -v
 ```
 
 ## Historial de versiones
+### v1.4.0 (no publicado)
+- Fidelidad orbital: la anomalía media `M` se propaga cada paso de
+  tiempo (`dM = n·dt`, movimiento kepleriano) y el RAAN deriva por
+  precesión nodal J2 (`dOmega/dt = -3/2·J2·n·(Re/p)²·cos(i)`); ambos
+  efectos son vectorizados (`propagar_elementos_orbitales_batch`) y
+  desactivables vía `ConfiguracionFisica`
+  (`propagar_anomalia_media`, `precesion_j2_habilitada`).
+- Eclipses por ángulo beta: la recarga solar de cada satélite se
+  escala por la fracción del día fuera de la (pen)umbra terrestre,
+  estimada desde su inclinación, la declinación solar del día y su
+  altitud (`calcular_beta_rad`, `fraccion_dia_en_eclipse`). Nunca baja
+  de `fraccion_recarga_minima` (albedo). Desactivable con
+  `eclipses_habilitados`.
+- Constantes físicas nuevas: `J2_TIERRA` y `VEL_ANGULAR_TIERRA_SOL_RAD_S`.
+- Fixes: recarga solar configurable
+  (`ConfiguracionFisica.recarga_solar_diaria_pct`), la reentrada
+  orbital ya no genera debris derelicto, checkpoints versionados
+  (rechazo claro de esquemas incompatibles), `cargar_checkpoint`
+  restaura el contador de IDs, `probabilidad_colision_batch` usa el
+  mismo fallback de banda que la versión escalar, se eliminó el
+  parámetro muerto `ciclo_solar` de `calcular_lambda_total` y
+  `DistribucionFalla.probabilidad_falla_diaria` emite
+  `DeprecationWarning`. Añadido `requirements.txt`.
+
 
 ### v1.3.0
 - Nuevos mecanismos evolutivos a nivel de constelación en

@@ -31,6 +31,9 @@ from sat import (
     aplicar_radiacion_cosmica_batch,
     actualizar_metabolismo_batch,
     calcular_lambda_total_batch,
+    propagar_elementos_orbitales_batch,
+    fraccion_dia_en_eclipse,
+    calcular_beta_rad,
 )
 
 
@@ -285,7 +288,10 @@ class TestFuncionesBatch:
     def test_metabolismo_batch_respeta_recarga_solar_configurable(self, config, rng):
         # La recarga solar (+10 por defecto) debe venir de la
         # configuracion, no estar hardcodeada en la funcion batch.
-        config_recarga = ConfiguracionFisica(recarga_solar_diaria_pct=20.0)
+        # eclipses desactivados para probar solo la recarga configurable
+        config_recarga = ConfiguracionFisica(
+            recarga_solar_diaria_pct=20.0, eclipses_habilitados=False
+        )
         poblacion = self._crear_poblacion(config_recarga, rng)
         for sat in poblacion:
             sat.energia = 50.0
@@ -294,6 +300,72 @@ class TestFuncionesBatch:
         np.testing.assert_allclose(
             np.array([s.energia for s in poblacion]), 65.0, rtol=1e-10
         )
+
+
+    def test_propagacion_anomalia_media(self, config, rng):
+        # a=6771 km (400 km alt): n = sqrt(GM/a^3); tras 1 dia M avanza
+        # n*86400 en grados (mod 360).
+        sat = _crear_satelite(config, rng, a=6771.0)
+        M_inicial = sat.M
+        propagar_elementos_orbitales_batch([sat], 1.0, config)
+        n_rad_s = np.sqrt(config.gm_tierra_km3_s2 / 6771.0 ** 3)
+        esperado = (M_inicial + np.degrees(n_rad_s * 86400.0)) % 360.0
+        assert sat.M == pytest.approx(esperado, abs=1e-6)
+
+    def test_propagacion_respetada_como_opt_in(self, config, rng):
+        cfg_off = ConfiguracionFisica(propagar_anomalia_media=False,
+                                      precesion_j2_habilitada=False)
+        sat = _crear_satelite(config, rng, a=6771.0, Omega=42.0)
+        M_inicial, Omega_inicial = sat.M, sat.Omega
+        propagar_elementos_orbitales_batch([sat], 10.0, cfg_off)
+        assert sat.M == M_inicial
+        assert sat.Omega == Omega_inicial
+
+    def test_precesion_j2_iss(self, config, rng):
+        # ISS-like (i=51.6, a=6771): deriva del RAAN ~ -5 grados/dia.
+        sat = _crear_satelite(config, rng, a=6771.0, i=51.6, e=0.001, Omega=0.0)
+        propagar_elementos_orbitales_batch([sat], 1.0, config)
+        assert -5.5 < (sat.Omega - 360.0 if sat.Omega > 180 else sat.Omega) < -4.5
+
+    def test_precesion_j2_nula_en_orbita_polar(self, config, rng):
+        # cos(90)=0: una orbita polar no deriva su RAAN por J2.
+        sat = _crear_satelite(config, rng, a=6771.0, i=90.0, e=0.001, Omega=10.0)
+        propagar_elementos_orbitales_batch([sat], 365.0, config)
+        assert sat.Omega == pytest.approx(10.0, abs=1e-9)
+
+    def test_fraccion_eclipse_beta_cero_y_sin_eclipse(self, config):
+        # beta=0 y alt=400 km: fraccion = 2*rho_e/(2*pi) ~ 0.111
+        f = fraccion_dia_en_eclipse(0.0, 400.0, config)
+        rho = np.arccos(config.radio_tierra_km / (400.0 + config.radio_tierra_km)) \
+            + config.radio_angular_sol_rad
+        assert f == pytest.approx(2 * rho / (2 * np.pi), rel=1e-9)
+        assert 0.0 < f < 0.5
+        # beta mayor al angulo de eclipse: orbita siempre iluminada
+        assert fraccion_dia_en_eclipse(1.4, 400.0, config) == 0.0
+
+    def test_beta_maximo_en_solsticio(self, config):
+        # Solsticio (~dia 172), i=51.6: beta ~ 23.44*sin(51.6) = 18.3 deg.
+        beta = calcular_beta_rad(172, 51.6)
+        assert np.degrees(beta) == pytest.approx(18.3, abs=0.2)
+
+    def test_eclipses_reducen_recarga_solar(self, config, rng):
+        # Con eclipses activados, un satelite con beta pequeño recarga
+        # menos que uno en orbita siempre iluminada; nunca menos del piso.
+        cfg_ecl = ConfiguracionFisica(eclipses_habilitados=True)
+        sat_beta_bajo = _crear_satelite(config, rng, i=51.6)
+        sat_beta_bajo.energia = 50.0
+        actualizar_metabolismo_batch([sat_beta_bajo], cfg_ecl,
+                                     dias_transcurridos=100)
+        # recarga efectiva < nominal (10): energia < 50+10-5 = 55
+        assert sat_beta_bajo.energia < 55.0
+        assert sat_beta_bajo.energia > 50.0  # el piso evita quedarse a 0 de recarga
+        # Sin eclipses (control): recarga nominal completa
+        cfg_no_ecl = ConfiguracionFisica(eclipses_habilitados=False)
+        sat_control = _crear_satelite(config, rng, i=51.6)
+        sat_control.energia = 50.0
+        actualizar_metabolismo_batch([sat_control], cfg_no_ecl,
+                                     dias_transcurridos=100)
+        assert sat_control.energia == pytest.approx(55.0)
 
 
 # =============================================================================

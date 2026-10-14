@@ -49,6 +49,13 @@ import pickle
 # Constante gravitacional terrestre estándar (GM), en km^3/s^2
 GM_TIERRA_KM3_S2 = 398600.4
 RADIO_TIERRA_KM = 6371.0
+# Factor zonal armónico J2 de la Tierra (aplanamiento del geoide), que
+# causa la precesión nodal (deriva del RAAN) y la precesión del perigeo.
+J2_TIERRA = 1.08262668e-3
+# Velocidad angular media de la Tierra alrededor del Sol (rad/s), usada
+# para calcular el ángulo beta de la órbita respecto al terminador Sol-
+# Tierra (eclipses).
+VEL_ANGULAR_TIERRA_SOL_RAD_S = 1.991e-7
 
 # Generador de números aleatorios usado como fallback cuando un Satellite
 # se crea directamente (sin pasar por SimulacionSatelites, que gestiona su
@@ -93,6 +100,26 @@ class ConfiguracionFisica:
     # `actualizar_metabolismo_batch`); antes estaba hardcodeada como un
     # número mágico `+10.0` dentro de la función.
     recarga_solar_diaria_pct: float = 10.0
+    # =========================================================================
+    # EFECTOS SECULARES Y ECLIPSES (Fase: fidelidad orbital)
+    # =========================================================================
+    # Propagación de la anomalía media M por paso de tiempo (movimiento
+    # kepleriano puro: dM = n·dt). Si es False, M queda estático como en
+    # la versión original.
+    propagar_anomalia_media: bool = True
+    # Precesión nodal J2 (dOmega/dt, Vallado): si es False, el RAAN no
+    # deriva y las bandas de RAAN de la constelación quedan fijas.
+    precesion_j2_habilitada: bool = True
+    # Eclipses por ángulo beta: fracción del día en eclipse estimada como
+    # f(beta, altitud). Si es False, la recarga solar es la nominal
+    # completa todos los días.
+    eclipses_habilitados: bool = True
+    # Radio del Sol proyectado sobre la esfera celeste (rad), para el
+    # cálculo del ángulo de penumbra en los eclipses.
+    radio_angular_sol_rad: float = 0.00465
+    # Cobertura mínima de recarga: aún en eclipse total, los paneles
+    # entregan una fracción mínima (albedo/reflejos) de la recarga nominal.
+    fraccion_recarga_minima: float = 0.1
 
     # Tasas aditivas de falla (ver Satellite.calcular_lambda_total)
     factor_lambda_radiacion: float = 0.002
@@ -1364,19 +1391,132 @@ def aplicar_radiacion_cosmica_batch(satelites: List['Satellite'],
     return radiacion_arr >= limite_arr
 
 
+def propagar_elementos_orbitales_batch(satelites: List['Satellite'],
+                                       dt_dias: float,
+                                       config: ConfiguracionFisica) -> None:
+    """
+    Propaga la anomalía media y aplica la precesión secular J2 de toda
+    la población en una sola pasada vectorizada (Fase: fidelidad orbital).
+    1. Anomalía media: dM = n·dt con n = sqrt(GM/a³) (movimiento
+       kepleriano puro), en grados (M %= 360).
+    2. Precesión nodal J2 (Vallado, "Fundamentals of Astrodynamics",
+       ecuación estándar de precesión nodal):
+       dOmega/dt = -3/2 · J2 · n · (Re/p)² · cos(i)
+       con p = a(1-e²). Para órbitas retrógradas (i>90°) el RAAN
+       retrocede; para i=90° (polares) no hay deriva.
+    Muta `M` y `Omega` de cada satélite in-place. `omega` (argumento del
+    perigeo) también precesa por J2, pero no afecta ninguno de los
+    mecanismos de la simulación (los rasgos dependen de Omega, a, e, i),
+    así que se omite por rendimiento.
+    Args:
+        satelites: lista de satélites a propagar.
+        dt_dias: paso de tiempo en días.
+        config: configuración física compartida.
+    """
+    n = len(satelites)
+    if n == 0:
+        return
+    a_arr = np.array([s.a for s in satelites], dtype=float)
+    e_arr = np.array([s.e for s in satelites], dtype=float)
+    i_arr = np.radians(np.array([s.i for s in satelites], dtype=float))
+
+    # Movimiento medio (rad/s) y avance de la anomalía media en grados
+    n_rad_s = np.sqrt(config.gm_tierra_km3_s2 / a_arr ** 3)
+    if config.propagar_anomalia_media:
+        dM_grados = np.degrees(n_rad_s * dt_dias * 86400.0) % 360.0
+        for idx, sat in enumerate(satelites):
+            sat.M = (sat.M + float(dM_grados[idx])) % 360.0
+
+    if not config.precesion_j2_habilitada:
+        return
+    # Precesión nodal: dOmega/dt = -3/2 J2 n (Re/p)^2 cos(i)
+    p_arr = a_arr * (1.0 - e_arr ** 2)
+    factor = -1.5 * J2_TIERRA * n_rad_s * (config.radio_tierra_km / p_arr) ** 2
+    dOmega_rad = factor * np.cos(i_arr) * dt_dias * 86400.0
+    dOmega_grados = np.degrees(dOmega_rad)
+    for idx, sat in enumerate(satelites):
+        sat.Omega = (sat.Omega + float(dOmega_grados[idx])) % 360.0
+
+
+def fraccion_dia_en_eclipse(beta_abs: float, altitud_km: float,
+                            config: ConfiguracionFisica) -> float:
+    """
+    Fracción del día que un satélite pasa en (pen)umbra de la Tierra,
+    dado el ángulo beta (ángulo entre el plano orbital y la dirección
+    Sol-Tierra) y la altitud de la órbita.
+    Aproximación estándar para órbita circular (p. ej. Wertz, "Spacecraft
+    Attitude Determination and Control"): el satélite entra en eclipse
+    cuando el ángulo entre su posición y la dirección al Sol es menor
+    que el ángulo de eclipses rho_e = arccos(Re / r) + radio_angular_sol.
+    La fracción del día en eclipse es f = (pi - 2·beta) / (2·pi) cuando
+    beta < rho_e, y 0 cuando beta >= rho_e (órbita siempre iluminada).
+    Para beta=0 (plano orbital contiene al Sol: eclipse central máximo)
+    la fracción depende del arco eclipsado.
+    Args:
+        beta_abs: valor absoluto del ángulo beta en radianes.
+        altitud_km: altitud de la órbita (km).
+        config: configuración física (radio terrestre, radio angular del Sol).
+    Returns:
+        Fracción del día en eclipse (0 a ~0.4 para LEO).
+    """
+    r = altitud_km + config.radio_tierra_km
+    rho_eclipse = np.arccos(config.radio_tierra_km / r) + config.radio_angular_sol_rad
+    if beta_abs >= rho_eclipse:
+        return 0.0
+    # Longitud de arco de la órbita que cae en sombra, sobre el total 2pi.
+    # Para órbita circular el arco eclipsado es 2·(rho_e - beta), limitado
+    # a [0, 2·rho_e].
+    arco_eclipsado = 2.0 * max(rho_eclipse - beta_abs, 0.0)
+    return float(min(arco_eclipsado / (2.0 * np.pi), 0.5))
+
+
+def calcular_beta_rad(dias_transcurridos: float,
+                      inclinacion_grados: float) -> float:
+    """
+    Aproximación del ángulo beta de una órbita: ángulo entre el plano
+    orbital y el vector Tierra→Sol.
+    beta ≈ asin( sin(i) · sin(δ_solar) ) + corrección por estación,
+    donde δ_solar es la declinación solar. Aproximamos la declinación
+    solar con la órbita anual: δ = 23.44° · sin(2π · (d - 80) / 365.25)
+    (solsticio ~d=172, equinoccio ~d=80).
+    Args:
+        dias_transcurridos: días desde el inicio de la simulación (se
+            asume que el inicio corresponde aprox. al equinoccio de
+            primavera para la fase de la declinación; para una simulación
+            evolutiva de años solo importa el ciclo anual, no la fase).
+        inclinacion_grados: inclinación orbital en grados.
+    Returns:
+        beta en radianes (valor absoluto; la recarga depende de |beta|).
+    """
+    declinacion_grados = 23.44 * np.sin(2 * np.pi * (dias_transcurridos - 80) / 365.25)
+    beta = np.arcsin(np.clip(
+        np.sin(np.radians(inclinacion_grados)) * np.sin(np.radians(declinacion_grados)),
+        -1.0, 1.0,
+    ))
+    return float(abs(beta))
+
+
 def actualizar_metabolismo_batch(satelites: List['Satellite'],
-                                config: Optional[ConfiguracionFisica] = None) -> np.ndarray:
+                                config: Optional[ConfiguracionFisica] = None,
+                                dias_transcurridos: float = 0.0) -> np.ndarray:
     """
     Versión vectorizada de la recarga/consumo diario de energía
     (:meth:`Satellite.recargar_energia` + :meth:`Satellite.consumir_energia`).
 
-    Muta `energia` de cada satélite in-place.
+    Muta `energia` de cada satélite in-place. Si `config.eclipses_habilitados`,
+    la recarga solar de cada satélite se escala por (1 - fracción del día
+    en eclipse), estimada desde su inclinación y el día del año
+    (ver :func:`fraccion_dia_en_eclipse` y :func:`calcular_beta_rad`);
+    en eclipse total la recarga no baja de `fraccion_recarga_minima`.
 
     Args:
         satelites: lista de satélites a actualizar.
         config: configuración física compartida que provee
             `recarga_solar_diaria_pct`; si es None, se usan los valores
             por defecto (compatibilidad con llamadas previas).
+        dias_transcurridos: días desde el inicio de la simulación, usados
+            para la declinación solar (eclipses). Solo relevante si
+            `config.eclipses_habilitados`.
 
     Returns:
         Array booleano indicando qué satélites se quedaron sin energía
@@ -1390,8 +1530,25 @@ def actualizar_metabolismo_batch(satelites: List['Satellite'],
     energia_arr = np.array([s.energia for s in satelites], dtype=float)
     consumo_arr = np.array([s.consumo_energico_diario for s in satelites], dtype=float)
 
-    energia_arr = (np.minimum(energia_arr + config_efectiva.recarga_solar_diaria_pct, 100.0)
-                   - consumo_arr)
+    # Recarga solar efectiva por satélite: la nominal escalada por la
+    # fracción del día fuera de eclipse (Fase: eclipses por beta-angle).
+    recarga_arr = np.full(n, config_efectiva.recarga_solar_diaria_pct)
+    if config_efectiva.eclipses_habilitados:
+        fracciones_eclipse = np.array([
+            fraccion_dia_en_eclipse(
+                calcular_beta_rad(dias_transcurridos, sat.i),
+                sat.altitud_km(),
+                config_efectiva,
+            )
+            for sat in satelites
+        ])
+        recarga_arr = recarga_arr * (1.0 - fracciones_eclipse)
+        # En eclipse total la recarga no baja del mínimo (albedo):
+        piso = (config_efectiva.recarga_solar_diaria_pct
+                * config_efectiva.fraccion_recarga_minima)
+        recarga_arr = np.maximum(recarga_arr, piso)
+
+    energia_arr = np.minimum(energia_arr + recarga_arr, 100.0) - consumo_arr
 
     for idx, sat in enumerate(satelites):
         sat.energia = float(energia_arr[idx])
@@ -2130,7 +2287,9 @@ class SimulacionSatelites:
         supervivientes_radiacion = [sat for sat in supervivientes_drag if sat.activo]
 
         # 4. Metabolismo: recarga y consumo de energía (vectorizado)
-        mascara_sin_energia = actualizar_metabolismo_batch(supervivientes_radiacion, self.config)
+        mascara_sin_energia = actualizar_metabolismo_batch(
+            supervivientes_radiacion, self.config, self.dias_transcurridos
+        )
         for sat, sin_energia in zip(supervivientes_radiacion, mascara_sin_energia):
             if sin_energia:
                 sat.activo = False
@@ -2141,6 +2300,13 @@ class SimulacionSatelites:
 
         # Limpiar muertos del activos
         self.satelites_activos = [sat for sat in supervivientes_radiacion if sat.activo]
+
+        # 5. Propagacion orbital: anomalia media (dM = n·dt) y precesion
+        # nodal J2 del RAAN (Fase: fidelidad orbital). Muta M/Omega
+        # in-place para toda la poblacion en una sola pasada.
+        propagar_elementos_orbitales_batch(
+            self.satelites_activos, 1.0, self.config
+        )
     
     def paso_tiempo(self, dias: int = 1) -> Dict:
         """
