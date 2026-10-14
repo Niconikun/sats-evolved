@@ -25,6 +25,7 @@ from sat import (
     CicloSolar,
     RadiacionCosmica,
     SimulacionSatelites,
+    DistribucionFalla,
     aplicar_drag_atmosferico_batch,
     aplicar_presion_radiacion_solar_batch,
     aplicar_radiacion_cosmica_batch,
@@ -275,7 +276,7 @@ class TestFuncionesBatch:
 
         lambda_batch = calcular_lambda_total_batch(poblacion, edades, riesgos_debris, config)
         lambda_escalar = np.array([
-            sat.calcular_lambda_total(edad, riesgo, ciclo_solar)
+            sat.calcular_lambda_total(edad, riesgo)
             for sat, edad, riesgo in zip(poblacion, edades, riesgos_debris)
         ])
 
@@ -428,6 +429,30 @@ class TestSimulacionSatelites:
         assert len(reentrados) > 0
         assert sim.debris.densidad <= debris_antes
 
+
+    def test_checkpoint_rechaza_esquema_incompatible(self, tmp_path):
+        # Un checkpoint guardado con otra version de esquema debe
+        # rechazarse con un error claro, no fallar de forma
+        # impredecible al deserializar.
+        sim = self._correr(semilla=71, dias=10)
+        ruta = tmp_path / "checkpoint_bad.pkl"
+        sim.guardar_checkpoint(str(ruta))
+        with open(ruta, "rb") as f:
+            objeto = pickle.load(f)
+        objeto._version_esquema_checkpoint = (
+            SimulacionSatelites._VERSION_ESQUEMA_CHECKPOINT + 1
+        )
+        with open(ruta, "wb") as f:
+            pickle.dump(objeto, f)
+        with pytest.raises(ValueError, match="esquema incompatible"):
+            SimulacionSatelites.cargar_checkpoint(str(ruta))
+
+    def test_distribucion_falla_legacy_emite_deprecation_warning(self):
+        # DistribucionFalla.probabilidad_falla_diaria es legacy: el
+        # motor usa Satellite.calcular_lambda_total (tasas aditivas).
+        with pytest.warns(DeprecationWarning, match="deprecado"):
+            DistribucionFalla().probabilidad_falla_diaria(100.0)
+
     def test_checkpoint_es_picklable_directamente(self):
         sim = self._correr(semilla=3, dias=10)
         datos = pickle.dumps(sim)
@@ -527,8 +552,8 @@ class TestMecanismosEvolutivosConstelacion:
             config, rng, calidad_inherente=0.5,
             maniobrabilidad_evasiva=1.0, combustible=100.0
         )
-        lam_sin = sat_sin_evasion.calcular_lambda_total(100, 0.05, ciclo_solar)
-        lam_con = sat_con_evasion.calcular_lambda_total(100, 0.05, ciclo_solar)
+        lam_sin = sat_sin_evasion.calcular_lambda_total(100, 0.05)
+        lam_con = sat_con_evasion.calcular_lambda_total(100, 0.05)
         assert lam_con < lam_sin
 
     def test_evasion_no_reduce_lambda_sin_combustible(self, config, rng):
@@ -542,8 +567,8 @@ class TestMecanismosEvolutivosConstelacion:
             config, rng, calidad_inherente=0.5,
             maniobrabilidad_evasiva=1.0, combustible=combustible_bajo
         )
-        lam_sin = sat_sin_evasion.calcular_lambda_total(100, 0.05, ciclo_solar)
-        lam_con = sat_con_evasion.calcular_lambda_total(100, 0.05, ciclo_solar)
+        lam_sin = sat_sin_evasion.calcular_lambda_total(100, 0.05)
+        lam_con = sat_con_evasion.calcular_lambda_total(100, 0.05)
         # Sin combustible suficiente para maniobrar, el rasgo de evasión
         # no tiene efecto (mismo lambda con o sin el rasgo).
         assert lam_con == pytest.approx(lam_sin)

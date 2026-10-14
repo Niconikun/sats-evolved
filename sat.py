@@ -38,6 +38,8 @@ días y las magnitudes de calidad/energía/combustible/radiación están
 normalizadas entre 0 y 1 (o 0-100 para energía/combustible en "%").
 """
 
+import warnings
+
 import numpy as np
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional
@@ -972,8 +974,7 @@ class Satellite:
     # =========================================================================
     
     def calcular_lambda_total(self, edad_dias: float, 
-                             riesgo_debris: float,
-                             ciclo_solar: 'CicloSolar') -> float:
+                             riesgo_debris: float) -> float:
         """
         Calcula tasa total de falla como SUMA de mecanismos independientes.
         
@@ -984,7 +985,6 @@ class Satellite:
         Args:
             edad_dias: edad en días
             riesgo_debris: probabilidad base de colisión (0-1)
-            ciclo_solar: instancia de CicloSolar
             
         Returns:
             tasa de falla total (en unidades de fallos por día)
@@ -1042,20 +1042,19 @@ class Satellite:
         return lambda_total
     
     def probabilidad_falla_diaria_aditiva(self, edad_dias: float,
-                                         riesgo_debris: float,
-                                         ciclo_solar: 'CicloSolar') -> float:
+                                         riesgo_debris: float) -> float:
         """
         Convierte tasa total a probabilidad de falla en un día.
         
         P(falla en 1 día) = 1 - exp(-λ_total)
         
         Args:
-            edad_dias, riesgo_debris, ciclo_solar: como calcular_lambda_total
+            edad_dias, riesgo_debris: como calcular_lambda_total
             
         Returns:
             probabilidad de falla (0-1)
         """
-        lambda_total = self.calcular_lambda_total(edad_dias, riesgo_debris, ciclo_solar)
+        lambda_total = self.calcular_lambda_total(edad_dias, riesgo_debris)
         # Convertir tasa a probabilidad de falla diaria
         prob = 1 - np.exp(-lambda_total)
         return min(prob, 1.0)
@@ -1510,7 +1509,8 @@ class DistribucionFalla:
                                  degradacion: float = 0.0) -> float:
         """
         Método legacy para compatibilidad.
-        NOTA: Este método está deprecado, usar calcular_lambda_total() en Satellite
+        NOTA: Este método está deprecado, usar calcular_lambda_total() en
+        Satellite (emite DeprecationWarning al invocarse).
         
         Args:
             edad_dias: edad en días
@@ -1520,6 +1520,12 @@ class DistribucionFalla:
         Returns:
             probabilidad de falla (0-1)
         """
+        warnings.warn(
+            "DistribucionFalla.probabilidad_falla_diaria está deprecado; "
+            "usar Satellite.calcular_lambda_total (modelo de tasas aditivas).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         escala_dias = self.escala_tiempo * 365.25
         
         if edad_dias == 0:
@@ -2343,6 +2349,13 @@ class SimulacionSatelites:
         print(f"\nSimulación completada. Tiempo final: {self.tiempo_actual}")
         return self.historial
     
+    # Version del esquema de checkpoint: incrementar al cambiar la
+    # estructura serializada (atributos de SimulacionSatelites/Satellite/
+    # subsistemas) para que `cargar_checkpoint` rechace archivos
+    # incompatibles con un error claro en vez de fallar de forma
+    # silenciosa o impredecible al deserializar.
+    _VERSION_ESQUEMA_CHECKPOINT = 1
+    
     def guardar_checkpoint(self, ruta: str) -> None:
         """
         Serializa el estado completo de la simulación (satélites activos y
@@ -2354,6 +2367,7 @@ class SimulacionSatelites:
         Args:
             ruta: ruta del archivo donde guardar el checkpoint.
         """
+        self._version_esquema_checkpoint = self._VERSION_ESQUEMA_CHECKPOINT
         with open(ruta, "wb") as f:
             pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
     
@@ -2369,9 +2383,24 @@ class SimulacionSatelites:
 
         Returns:
             Instancia restaurada de `SimulacionSatelites`.
+
+        Raises:
+            ValueError: si el checkpoint fue guardado con una versión
+                de esquema incompatible con el código actual.
         """
         with open(ruta, "rb") as f:
             simulacion = pickle.load(f)
+        version_archivo = getattr(
+            simulacion, "_version_esquema_checkpoint", None
+        )
+        version_actual = SimulacionSatelites._VERSION_ESQUEMA_CHECKPOINT
+        if version_archivo != version_actual:
+            raise ValueError(
+                f"Checkpoint con esquema incompatible: el archivo fue "
+                f"guardado con versión {version_archivo!r} y el código "
+                f"actual espera la versión {version_actual}. Regenera el "
+                f"checkpoint con la versión actual del simulador."
+            )
         # `Satellite._contador` es un atributo de clase y no se serializa
         # con el checkpoint: al restaurarlo en un proceso nuevo arrancaria
         # en 0 y los proximos satelites lanzados recibirian IDs ya usados
