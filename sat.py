@@ -38,6 +38,8 @@ días y las magnitudes de calidad/energía/combustible/radiación están
 normalizadas entre 0 y 1 (o 0-100 para energía/combustible en "%").
 """
 
+import warnings
+
 import numpy as np
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional
@@ -47,6 +49,13 @@ import pickle
 # Constante gravitacional terrestre estándar (GM), en km^3/s^2
 GM_TIERRA_KM3_S2 = 398600.4
 RADIO_TIERRA_KM = 6371.0
+# Factor zonal armónico J2 de la Tierra (aplanamiento del geoide), que
+# causa la precesión nodal (deriva del RAAN) y la precesión del perigeo.
+J2_TIERRA = 1.08262668e-3
+# Velocidad angular media de la Tierra alrededor del Sol (rad/s), usada
+# para calcular el ángulo beta de la órbita respecto al terminador Sol-
+# Tierra (eclipses).
+VEL_ANGULAR_TIERRA_SOL_RAD_S = 1.991e-7
 
 # Generador de números aleatorios usado como fallback cuando un Satellite
 # se crea directamente (sin pasar por SimulacionSatelites, que gestiona su
@@ -87,6 +96,30 @@ class ConfiguracionFisica:
 
     # Metabolismo
     consumo_energico_diario_pct: float = 5.0
+    # Recarga solar diaria (puntos porcentuales de energía, ver
+    # `actualizar_metabolismo_batch`); antes estaba hardcodeada como un
+    # número mágico `+10.0` dentro de la función.
+    recarga_solar_diaria_pct: float = 10.0
+    # =========================================================================
+    # EFECTOS SECULARES Y ECLIPSES (Fase: fidelidad orbital)
+    # =========================================================================
+    # Propagación de la anomalía media M por paso de tiempo (movimiento
+    # kepleriano puro: dM = n·dt). Si es False, M queda estático como en
+    # la versión original.
+    propagar_anomalia_media: bool = True
+    # Precesión nodal J2 (dOmega/dt, Vallado): si es False, el RAAN no
+    # deriva y las bandas de RAAN de la constelación quedan fijas.
+    precesion_j2_habilitada: bool = True
+    # Eclipses por ángulo beta: fracción del día en eclipse estimada como
+    # f(beta, altitud). Si es False, la recarga solar es la nominal
+    # completa todos los días.
+    eclipses_habilitados: bool = True
+    # Radio del Sol proyectado sobre la esfera celeste (rad), para el
+    # cálculo del ángulo de penumbra en los eclipses.
+    radio_angular_sol_rad: float = 0.00465
+    # Cobertura mínima de recarga: aún en eclipse total, los paneles
+    # entregan una fracción mínima (albedo/reflejos) de la recarga nominal.
+    fraccion_recarga_minima: float = 0.1
 
     # Tasas aditivas de falla (ver Satellite.calcular_lambda_total)
     factor_lambda_radiacion: float = 0.002
@@ -115,6 +148,33 @@ class ConfiguracionFisica:
     # satélite con `maniobrabilidad_evasiva` = 1.0 y combustible
     # suficiente para maniobrar (ver Satellite.calcular_lambda_total).
     factor_reduccion_evasion_max: float = 0.7
+    # Costo diario de combustible (puntos porcentuales) de las
+    # maniobras de evasión de debris, proporcional a
+    # `maniobrabilidad_evasiva` y solo cuando hay combustible sobre el
+    # umbral (trade-off evitación vs. longevidad de maniobras).
+    costo_combustible_evasion_diario_pct: float = 0.1
+    # =========================================================================
+    # ESPECIACIÓN Y COBERTURA (Fase: ecología de la constelación)
+    # =========================================================================
+    # Aislamiento reproductivo por banda orbital (especiación alopátrica):
+    # la recombinación sexual solo puede ocurrir entre padres de la misma
+    # banda orbital; si no hay pareja compatible, cae a reproducción
+    # asexual del padre sorteado.
+    aislamiento_reproductivo_por_banda: bool = True
+    # Peso del bono de fitness de cobertura de banda: satélites cuya banda
+    # orbital está poco representada entre los candidatos reciben un bono
+    # (0 = desactivado; el bono escala hasta 1 + peso para el nicho menos
+    # poblado).
+    peso_bono_cobertura_banda: float = 0.5
+    # Mutación "saltacional" rara: con esta probabilidad por hijo, un rasgo
+    # heredable (calidad, agresividad r/K, evasión) salta uniformemente a
+    # un valor nuevo del rango completo en vez de mutar gaussianamente.
+    # Permite escapar de óptimos locales en el paisaje evolutivo.
+    prob_mutacion_saltacional: float = 0.01
+    # Días consecutivos con riesgo de cascada > 1 (debris generado >
+    # decaído) en una banda para declarar el "punto de no retorno" de
+    # Kessler en esa banda.
+    dias_sostenidos_punto_no_retorno: int = 30
 
     # Estrategias r/K (trade-off reproducción vs. longevidad): umbrales de
     # energía/combustible para calificar como candidato a reproducirse,
@@ -428,12 +488,25 @@ class DebrisEspacial:
         """
         altitudes = np.asarray(altitudes_km, dtype=float)
         resultado = np.zeros_like(altitudes)
+        procesadas = np.zeros(altitudes.shape, dtype=bool)
         for banda, alt_min, alt_max, _ in self._BANDAS:
             mascara = (altitudes >= alt_min) & (altitudes < alt_max)
             riesgo_banda = min(
                 self._RIESGO_BASE[banda] * self.densidad_normalizada_banda(banda), 0.1
             )
             resultado[mascara] = riesgo_banda
+            procesadas |= mascara
+        # Igual que en la version escalar (_banda_de_altitud), las
+        # altitudes fuera de toda banda (p. ej. negativas por un semieje
+        # degradado) usan la ultima banda como fallback, en vez de
+        # quedar con riesgo 0 y divergir de la version escalar.
+        banda_fallback = self._BANDAS[-1][0]
+        riesgo_fallback = min(
+            self._RIESGO_BASE[banda_fallback]
+            * self.densidad_normalizada_banda(banda_fallback),
+            0.1,
+        )
+        resultado[~procesadas] = riesgo_fallback
         return resultado
 
     def generar_debris_por_colision(self, altitud_km: float, masa_kg: float,
@@ -955,8 +1028,7 @@ class Satellite:
     # =========================================================================
     
     def calcular_lambda_total(self, edad_dias: float, 
-                             riesgo_debris: float,
-                             ciclo_solar: 'CicloSolar') -> float:
+                             riesgo_debris: float) -> float:
         """
         Calcula tasa total de falla como SUMA de mecanismos independientes.
         
@@ -967,7 +1039,6 @@ class Satellite:
         Args:
             edad_dias: edad en días
             riesgo_debris: probabilidad base de colisión (0-1)
-            ciclo_solar: instancia de CicloSolar
             
         Returns:
             tasa de falla total (en unidades de fallos por día)
@@ -1025,20 +1096,19 @@ class Satellite:
         return lambda_total
     
     def probabilidad_falla_diaria_aditiva(self, edad_dias: float,
-                                         riesgo_debris: float,
-                                         ciclo_solar: 'CicloSolar') -> float:
+                                         riesgo_debris: float) -> float:
         """
         Convierte tasa total a probabilidad de falla en un día.
         
         P(falla en 1 día) = 1 - exp(-λ_total)
         
         Args:
-            edad_dias, riesgo_debris, ciclo_solar: como calcular_lambda_total
+            edad_dias, riesgo_debris: como calcular_lambda_total
             
         Returns:
             probabilidad de falla (0-1)
         """
-        lambda_total = self.calcular_lambda_total(edad_dias, riesgo_debris, ciclo_solar)
+        lambda_total = self.calcular_lambda_total(edad_dias, riesgo_debris)
         # Convertir tasa a probabilidad de falla diaria
         prob = 1 - np.exp(-lambda_total)
         return min(prob, 1.0)
@@ -1106,6 +1176,19 @@ class Satellite:
         evasion_hijo = np.clip(
             self.maniobrabilidad_evasiva + rng_efectivo.normal(0, 0.05), 0.0, 1.0
         )
+
+        # Mutación saltacional rara: con prob
+        # `prob_mutacion_saltacional`, un rasgo salta uniformemente a un
+        # valor nuevo del rango completo (escapa de óptimos locales).
+        p_salto = self.config.prob_mutacion_saltacional
+        if p_salto > 0 and rng_efectivo.random() < p_salto:
+            rasgo_salto = rng_efectivo.integers(0, 3)
+            if rasgo_salto == 0:
+                calidad_hijo = float(rng_efectivo.uniform(0.1, 1.0))
+            elif rasgo_salto == 1:
+                agresividad_hijo = float(rng_efectivo.uniform(0.0, 1.0))
+            else:
+                evasion_hijo = float(rng_efectivo.uniform(0.0, 1.0))
         
         # El hijo hereda propiedades físicas
         combustible_hijo = self.combustible * 0.9
@@ -1173,6 +1256,19 @@ class Satellite:
         evasion_hijo = np.clip(
             combinar(self.maniobrabilidad_evasiva, otro_padre.maniobrabilidad_evasiva), 0.0, 1.0
         )
+
+        # Mutación saltacional rara (igual que en la vía asexual):
+        # con prob `prob_mutacion_saltacional`, un rasgo salta
+        # uniformemente a un valor nuevo del rango completo.
+        p_salto = self.config.prob_mutacion_saltacional
+        if p_salto > 0 and rng_efectivo.random() < p_salto:
+            rasgo_salto = rng_efectivo.integers(0, 3)
+            if rasgo_salto == 0:
+                calidad_hijo = float(rng_efectivo.uniform(0.1, 1.0))
+            elif rasgo_salto == 1:
+                agresividad_hijo = float(rng_efectivo.uniform(0.0, 1.0))
+            else:
+                evasion_hijo = float(rng_efectivo.uniform(0.0, 1.0))
 
         combustible_hijo = (self.combustible + otro_padre.combustible) / 2 * 0.9
         energia_hijo = (self.energia + otro_padre.energia) / 2 * 0.9
@@ -1348,15 +1444,132 @@ def aplicar_radiacion_cosmica_batch(satelites: List['Satellite'],
     return radiacion_arr >= limite_arr
 
 
-def actualizar_metabolismo_batch(satelites: List['Satellite']) -> np.ndarray:
+def propagar_elementos_orbitales_batch(satelites: List['Satellite'],
+                                       dt_dias: float,
+                                       config: ConfiguracionFisica) -> None:
+    """
+    Propaga la anomalía media y aplica la precesión secular J2 de toda
+    la población en una sola pasada vectorizada (Fase: fidelidad orbital).
+    1. Anomalía media: dM = n·dt con n = sqrt(GM/a³) (movimiento
+       kepleriano puro), en grados (M %= 360).
+    2. Precesión nodal J2 (Vallado, "Fundamentals of Astrodynamics",
+       ecuación estándar de precesión nodal):
+       dOmega/dt = -3/2 · J2 · n · (Re/p)² · cos(i)
+       con p = a(1-e²). Para órbitas retrógradas (i>90°) el RAAN
+       retrocede; para i=90° (polares) no hay deriva.
+    Muta `M` y `Omega` de cada satélite in-place. `omega` (argumento del
+    perigeo) también precesa por J2, pero no afecta ninguno de los
+    mecanismos de la simulación (los rasgos dependen de Omega, a, e, i),
+    así que se omite por rendimiento.
+    Args:
+        satelites: lista de satélites a propagar.
+        dt_dias: paso de tiempo en días.
+        config: configuración física compartida.
+    """
+    n = len(satelites)
+    if n == 0:
+        return
+    a_arr = np.array([s.a for s in satelites], dtype=float)
+    e_arr = np.array([s.e for s in satelites], dtype=float)
+    i_arr = np.radians(np.array([s.i for s in satelites], dtype=float))
+
+    # Movimiento medio (rad/s) y avance de la anomalía media en grados
+    n_rad_s = np.sqrt(config.gm_tierra_km3_s2 / a_arr ** 3)
+    if config.propagar_anomalia_media:
+        dM_grados = np.degrees(n_rad_s * dt_dias * 86400.0) % 360.0
+        for idx, sat in enumerate(satelites):
+            sat.M = (sat.M + float(dM_grados[idx])) % 360.0
+
+    if not config.precesion_j2_habilitada:
+        return
+    # Precesión nodal: dOmega/dt = -3/2 J2 n (Re/p)^2 cos(i)
+    p_arr = a_arr * (1.0 - e_arr ** 2)
+    factor = -1.5 * J2_TIERRA * n_rad_s * (config.radio_tierra_km / p_arr) ** 2
+    dOmega_rad = factor * np.cos(i_arr) * dt_dias * 86400.0
+    dOmega_grados = np.degrees(dOmega_rad)
+    for idx, sat in enumerate(satelites):
+        sat.Omega = (sat.Omega + float(dOmega_grados[idx])) % 360.0
+
+
+def fraccion_dia_en_eclipse(beta_abs: float, altitud_km: float,
+                            config: ConfiguracionFisica) -> float:
+    """
+    Fracción del día que un satélite pasa en (pen)umbra de la Tierra,
+    dado el ángulo beta (ángulo entre el plano orbital y la dirección
+    Sol-Tierra) y la altitud de la órbita.
+    Aproximación estándar para órbita circular (p. ej. Wertz, "Spacecraft
+    Attitude Determination and Control"): el satélite entra en eclipse
+    cuando el ángulo entre su posición y la dirección al Sol es menor
+    que el ángulo de eclipses rho_e = arccos(Re / r) + radio_angular_sol.
+    La fracción del día en eclipse es f = (pi - 2·beta) / (2·pi) cuando
+    beta < rho_e, y 0 cuando beta >= rho_e (órbita siempre iluminada).
+    Para beta=0 (plano orbital contiene al Sol: eclipse central máximo)
+    la fracción depende del arco eclipsado.
+    Args:
+        beta_abs: valor absoluto del ángulo beta en radianes.
+        altitud_km: altitud de la órbita (km).
+        config: configuración física (radio terrestre, radio angular del Sol).
+    Returns:
+        Fracción del día en eclipse (0 a ~0.4 para LEO).
+    """
+    r = altitud_km + config.radio_tierra_km
+    rho_eclipse = np.arccos(config.radio_tierra_km / r) + config.radio_angular_sol_rad
+    if beta_abs >= rho_eclipse:
+        return 0.0
+    # Longitud de arco de la órbita que cae en sombra, sobre el total 2pi.
+    # Para órbita circular el arco eclipsado es 2·(rho_e - beta), limitado
+    # a [0, 2·rho_e].
+    arco_eclipsado = 2.0 * max(rho_eclipse - beta_abs, 0.0)
+    return float(min(arco_eclipsado / (2.0 * np.pi), 0.5))
+
+
+def calcular_beta_rad(dias_transcurridos: float,
+                      inclinacion_grados: float) -> float:
+    """
+    Aproximación del ángulo beta de una órbita: ángulo entre el plano
+    orbital y el vector Tierra→Sol.
+    beta ≈ asin( sin(i) · sin(δ_solar) ) + corrección por estación,
+    donde δ_solar es la declinación solar. Aproximamos la declinación
+    solar con la órbita anual: δ = 23.44° · sin(2π · (d - 80) / 365.25)
+    (solsticio ~d=172, equinoccio ~d=80).
+    Args:
+        dias_transcurridos: días desde el inicio de la simulación (se
+            asume que el inicio corresponde aprox. al equinoccio de
+            primavera para la fase de la declinación; para una simulación
+            evolutiva de años solo importa el ciclo anual, no la fase).
+        inclinacion_grados: inclinación orbital en grados.
+    Returns:
+        beta en radianes (valor absoluto; la recarga depende de |beta|).
+    """
+    declinacion_grados = 23.44 * np.sin(2 * np.pi * (dias_transcurridos - 80) / 365.25)
+    beta = np.arcsin(np.clip(
+        np.sin(np.radians(inclinacion_grados)) * np.sin(np.radians(declinacion_grados)),
+        -1.0, 1.0,
+    ))
+    return float(abs(beta))
+
+
+def actualizar_metabolismo_batch(satelites: List['Satellite'],
+                                config: Optional[ConfiguracionFisica] = None,
+                                dias_transcurridos: float = 0.0) -> np.ndarray:
     """
     Versión vectorizada de la recarga/consumo diario de energía
     (:meth:`Satellite.recargar_energia` + :meth:`Satellite.consumir_energia`).
 
-    Muta `energia` de cada satélite in-place.
+    Muta `energia` de cada satélite in-place. Si `config.eclipses_habilitados`,
+    la recarga solar de cada satélite se escala por (1 - fracción del día
+    en eclipse), estimada desde su inclinación y el día del año
+    (ver :func:`fraccion_dia_en_eclipse` y :func:`calcular_beta_rad`);
+    en eclipse total la recarga no baja de `fraccion_recarga_minima`.
 
     Args:
         satelites: lista de satélites a actualizar.
+        config: configuración física compartida que provee
+            `recarga_solar_diaria_pct`; si es None, se usan los valores
+            por defecto (compatibilidad con llamadas previas).
+        dias_transcurridos: días desde el inicio de la simulación, usados
+            para la declinación solar (eclipses). Solo relevante si
+            `config.eclipses_habilitados`.
 
     Returns:
         Array booleano indicando qué satélites se quedaron sin energía
@@ -1366,15 +1579,61 @@ def actualizar_metabolismo_batch(satelites: List['Satellite']) -> np.ndarray:
     if n == 0:
         return np.zeros(0, dtype=bool)
 
+    config_efectiva = config or ConfiguracionFisica()
     energia_arr = np.array([s.energia for s in satelites], dtype=float)
     consumo_arr = np.array([s.consumo_energico_diario for s in satelites], dtype=float)
 
-    energia_arr = np.minimum(energia_arr + 10.0, 100.0) - consumo_arr
+    # Recarga solar efectiva por satélite: la nominal escalada por la
+    # fracción del día fuera de eclipse (Fase: eclipses por beta-angle).
+    recarga_arr = np.full(n, config_efectiva.recarga_solar_diaria_pct)
+    if config_efectiva.eclipses_habilitados:
+        fracciones_eclipse = np.array([
+            fraccion_dia_en_eclipse(
+                calcular_beta_rad(dias_transcurridos, sat.i),
+                sat.altitud_km(),
+                config_efectiva,
+            )
+            for sat in satelites
+        ])
+        recarga_arr = recarga_arr * (1.0 - fracciones_eclipse)
+        # En eclipse total la recarga no baja del mínimo (albedo):
+        piso = (config_efectiva.recarga_solar_diaria_pct
+                * config_efectiva.fraccion_recarga_minima)
+        recarga_arr = np.maximum(recarga_arr, piso)
+
+    energia_arr = np.minimum(energia_arr + recarga_arr, 100.0) - consumo_arr
 
     for idx, sat in enumerate(satelites):
         sat.energia = float(energia_arr[idx])
 
     return energia_arr <= 0
+
+
+def aplicar_costo_evasion_batch(satelites: List['Satellite'],
+                               config: ConfiguracionFisica) -> None:
+    """
+    Cobra el costo diario de combustible de las maniobras de evasión de
+    debris, proporcional a `maniobrabilidad_evasiva` y solo para
+    satélites con combustible sobre el umbral (Fase: coevolución con
+    costo). Muta `combustible` de cada satélite in-place.
+    Introducir el costo en una fase separada de `calcular_lambda_total`
+    (que es de solo-lectura, igual que su versión batch) preserva la
+    equivalencia batch/escalar verificada por los tests.
+    Args:
+        satelites: lista de satélites a actualizar.
+        config: configuración física compartida.
+    """
+    if not satelites:
+        return
+    umbral = config.umbral_combustible_bajo_pct
+    for sat in satelites:
+        if sat.combustible >= umbral:
+            sat.combustible = max(
+                0.0,
+                sat.combustible
+                - config.costo_combustible_evasion_diario_pct
+                * sat.maniobrabilidad_evasiva,
+            )
 
 
 def calcular_lambda_total_batch(satelites: List['Satellite'], edades_dias: np.ndarray,
@@ -1487,7 +1746,8 @@ class DistribucionFalla:
                                  degradacion: float = 0.0) -> float:
         """
         Método legacy para compatibilidad.
-        NOTA: Este método está deprecado, usar calcular_lambda_total() en Satellite
+        NOTA: Este método está deprecado, usar calcular_lambda_total() en
+        Satellite (emite DeprecationWarning al invocarse).
         
         Args:
             edad_dias: edad en días
@@ -1497,6 +1757,12 @@ class DistribucionFalla:
         Returns:
             probabilidad de falla (0-1)
         """
+        warnings.warn(
+            "DistribucionFalla.probabilidad_falla_diaria está deprecado; "
+            "usar Satellite.calcular_lambda_total (modelo de tasas aditivas).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         escala_dias = self.escala_tiempo * 365.25
         
         if edad_dias == 0:
@@ -1654,6 +1920,13 @@ class SimulacionSatelites:
         
         # Tracking de causas de muerte acumuladas (para visualización)
         self.causas_muerte_acumuladas: Dict[str, int] = {}
+
+        # Detección del punto de no retorno de Kessler por banda orbital:
+        # días consecutivos con riesgo de cascada > 1, y bandas que ya
+        # cruzaron el umbral sostenido (una vez cruzado, es permanente
+        # para la corrida: la cascada se autoabastece).
+        self._dias_cascada_sostenida: Dict[str, int] = {}
+        self.bandas_punto_no_retorno: set = set()
         
         # Mitigación de debris: pasivación + desorbitado controlado
         self.desorbitado_controlado_habilitado = desorbitado_controlado_habilitado
@@ -1796,7 +2069,38 @@ class SimulacionSatelites:
         """
         pesos_fitness = np.array([c.fitness_reproductivo() for c in candidatos])
         bono_diversidad = self._bono_diversidad_orbital(candidatos)
-        return pesos_fitness * bono_diversidad
+        return pesos_fitness * bono_diversidad * self._bono_cobertura_banda(candidatos)
+
+    def _bono_cobertura_banda(self, candidatos: List[Satellite]) -> np.ndarray:
+        """
+        Bono de fitness de cobertura de banda orbital (selección de
+        nicho a nivel de constelación, complementario al bono de RAAN):
+        satélites cuya banda orbital ("bajo", "leo_congestionado", "meo",
+        "geo") está menos representada entre los candidatos reciben un
+        bono mayor, favoreciendo que la reproducción pueble nichos de
+        altitud poco cubiertos en vez de concentrarse en la banda dominante.
+        El bono del nicho menos poblado escala hasta
+        `1 + peso_bono_cobertura_banda` (y hasta 1.0 para el más poblado);
+        con `peso_bono_cobertura_banda` = 0 queda desactivado.
+        Args:
+            candidatos: lista de satélites candidatos a reproducirse.
+        Returns:
+            Array de bonos positivos (mismo orden que `candidatos`).
+        """
+        peso = self.config.peso_bono_cobertura_banda
+        n = len(candidatos)
+        if peso <= 0.0 or n <= 1:
+            return np.ones(n)
+        bandas = [self.debris.banda_de_altitud(c.altitud_km()) for c in candidatos]
+        conteo: Dict[str, int] = {}
+        for banda in bandas:
+            conteo[banda] = conteo.get(banda, 0) + 1
+        max_conteo = max(conteo.values())
+        bono_por_banda = {
+            banda: 1.0 + peso * (1.0 - conteo[banda] / max_conteo)
+            for banda in conteo
+        }
+        return np.array([bono_por_banda[b] for b in bandas])
     
     def _probabilidad_reproduccion_exitosa(self, padre: Satellite) -> float:
         """
@@ -1869,16 +2173,29 @@ class SimulacionSatelites:
                     if self.rng.random() > self._probabilidad_reproduccion_exitosa(padre):
                         continue  # intento fallido por saturación orbital
 
-                    # 3. Recombinación sexual (crossover) vs. asexual
+                    # 3. Recombinación sexual (crossover) vs. asexual,
+                    #    con aislamiento reproductivo por banda orbital
+                    #    (especiación alopátrica): el segundo padre debe
+                    #    pertenecer a la misma banda que el primero; si no
+                    #    hay pareja compatible, cae a asexual.
                     if (len(padres_candidatos) > 1 and
                             self.rng.random() < self.prob_reproduccion_sexual):
-                        idx_padre2 = self.rng.choice(len(padres_candidatos), p=probabilidades)
-                        intentos = 0
-                        while idx_padre2 == idx_padre and intentos < 5:
-                            idx_padre2 = self.rng.choice(len(padres_candidatos), p=probabilidades)
-                            intentos += 1
-                        if idx_padre2 != idx_padre:
-                            padre2 = padres_candidatos[idx_padre2]
+                        if self.config.aislamiento_reproductivo_por_banda:
+                            banda_padre = self.debris.banda_de_altitud(padre.altitud_km())
+                            compatibles = [
+                                idx for idx, cand in enumerate(padres_candidatos)
+                                if idx != idx_padre
+                                and self.debris.banda_de_altitud(cand.altitud_km()) == banda_padre
+                            ]
+                        else:
+                            compatibles = [
+                                idx for idx in range(len(padres_candidatos))
+                                if idx != idx_padre
+                            ]
+                        if compatibles:
+                            prob_pareja = probabilidades[compatibles] / probabilidades[compatibles].sum()
+                            idx_padre2 = int(self.rng.choice(len(compatibles), p=prob_pareja))
+                            padre2 = padres_candidatos[compatibles[idx_padre2]]
                             hijo = padre.crear_hijo_sexual(
                                 padre2, self.tiempo_actual, self.tasa_mutacion, rng=self.rng
                             )
@@ -2038,6 +2355,12 @@ class SimulacionSatelites:
             satelites_supervivientes.append(sat)
 
         self.satelites_activos = satelites_supervivientes
+
+        # Costo diario de combustible de las maniobras de evasión
+        # (coevolución con costo: evadir debris gasta longevidad de
+        # maniobras). Fase separada del cálculo de lambda, que es de
+        # solo-lectura.
+        aplicar_costo_evasion_batch(self.satelites_activos, self.config)
     
     def actualizar_sistemas_ambientales(self):
         """
@@ -2074,7 +2397,10 @@ class SimulacionSatelites:
                 sat.causa_muerte = "reentrada_orbital"
                 self.satelites_muertos.append(sat)
                 self._registrar_causa_muerte(sat.causa_muerte)
-                self.debris.generar_debris_derelicto(sat.altitud_km())
+                # A diferencia del resto de causas, un satélite que
+                # reentra se desintegra en la atmósfera: no deja debris
+                # derelicto en su banda orbital (el drag elimina el
+                # objeto, no lo convierte en riesgo de colisión).
 
         supervivientes_drag = [sat for sat in activos if sat.activo]
 
@@ -2098,7 +2424,9 @@ class SimulacionSatelites:
         supervivientes_radiacion = [sat for sat in supervivientes_drag if sat.activo]
 
         # 4. Metabolismo: recarga y consumo de energía (vectorizado)
-        mascara_sin_energia = actualizar_metabolismo_batch(supervivientes_radiacion)
+        mascara_sin_energia = actualizar_metabolismo_batch(
+            supervivientes_radiacion, self.config, self.dias_transcurridos
+        )
         for sat, sin_energia in zip(supervivientes_radiacion, mascara_sin_energia):
             if sin_energia:
                 sat.activo = False
@@ -2109,6 +2437,13 @@ class SimulacionSatelites:
 
         # Limpiar muertos del activos
         self.satelites_activos = [sat for sat in supervivientes_radiacion if sat.activo]
+
+        # 5. Propagacion orbital: anomalia media (dM = n·dt) y precesion
+        # nodal J2 del RAAN (Fase: fidelidad orbital). Muta M/Omega
+        # in-place para toda la poblacion en una sola pasada.
+        propagar_elementos_orbitales_batch(
+            self.satelites_activos, 1.0, self.config
+        )
     
     def paso_tiempo(self, dias: int = 1) -> Dict:
         """
@@ -2138,6 +2473,22 @@ class SimulacionSatelites:
             
             # Decaimiento natural del debris + riesgo de cascada del día
             riesgo_cascada = self.debris.aplicar_decaimiento_diario()
+
+            # Detección del "punto de no retorno" de Kessler por banda:
+            # la banda entra en cascada sostenida cuando el debris
+            # generado supera al decaído (riesgo > 1) durante
+            # `dias_sostenidos_punto_no_retorno` días consecutivos.
+            for banda, riesgo in riesgo_cascada.items():
+                if riesgo > 1.0:
+                    self._dias_cascada_sostenida[banda] = (
+                        self._dias_cascada_sostenida.get(banda, 0) + 1
+                    )
+                else:
+                    self._dias_cascada_sostenida[banda] = 0
+                if (banda not in self.bandas_punto_no_retorno
+                        and self._dias_cascada_sostenida[banda]
+                        >= self.config.dias_sostenidos_punto_no_retorno):
+                    self.bandas_punto_no_retorno.add(banda)
             
             # Remoción activa de debris (ADR), si está habilitada
             if self.adr_habilitado and self.adr_tasa_remocion_anual > 0:
@@ -2170,6 +2521,7 @@ class SimulacionSatelites:
                 for banda in self.debris.densidad_por_banda
             },
             'riesgo_cascada': riesgo_cascada,
+            'bandas_punto_no_retorno': sorted(self.bandas_punto_no_retorno),
             'colisiones_totales': self.debris.colisiones_totales,
             'edad_promedio_dias': edad_promedio,
             'energia_promedio': energia_promedio,
@@ -2267,6 +2619,7 @@ class SimulacionSatelites:
         return float(np.mean([sat.calidad_inherente for sat in self.satelites_activos]))
     
     def ejecutar_simulacion(self, dias_totales: int = 1825,
+                           heredables: Optional[bool] = None,
                            checkpoint_cada_dias: Optional[int] = None,
                            checkpoint_ruta: str = "checkpoint_simulacion.pkl") -> List[Dict]:
         """
@@ -2278,6 +2631,11 @@ class SimulacionSatelites:
         Args:
             dias_totales: cantidad total de días a simular (por defecto
                 1825 días = 5 años).
+            heredables: si es True/False, sobrescribe `reproductor_habilitado`
+                durante la ejecución (equivalente a pasar el parámetro al
+                constructor). Si es None (por defecto), se usa el valor del
+                constructor. Se acepta por compatibilidad con la firma
+                documentada en el README.
             checkpoint_cada_dias: si se especifica, guarda un checkpoint
                 (ver :meth:`guardar_checkpoint`) cada esta cantidad de
                 días, para poder reanudar la simulación tras una
@@ -2293,6 +2651,8 @@ class SimulacionSatelites:
         print(f"  - Ciclos solares: Habilitados")
         print(f"  - Debris espacial: Habilitado")
         print(f"  - Radiación cósmica: Habilitada")
+        if heredables is not None:
+            self.reproductor_habilitado = bool(heredables)
         print(f"  - Heredabilidad: {'Habilitada' if self.reproductor_habilitado else 'Deshabilitada'}")
         print(f"Tiempo inicial: {self.tiempo_actual}\n")
         
@@ -2309,6 +2669,13 @@ class SimulacionSatelites:
         print(f"\nSimulación completada. Tiempo final: {self.tiempo_actual}")
         return self.historial
     
+    # Version del esquema de checkpoint: incrementar al cambiar la
+    # estructura serializada (atributos de SimulacionSatelites/Satellite/
+    # subsistemas) para que `cargar_checkpoint` rechace archivos
+    # incompatibles con un error claro en vez de fallar de forma
+    # silenciosa o impredecible al deserializar.
+    _VERSION_ESQUEMA_CHECKPOINT = 1
+    
     def guardar_checkpoint(self, ruta: str) -> None:
         """
         Serializa el estado completo de la simulación (satélites activos y
@@ -2320,6 +2687,7 @@ class SimulacionSatelites:
         Args:
             ruta: ruta del archivo donde guardar el checkpoint.
         """
+        self._version_esquema_checkpoint = self._VERSION_ESQUEMA_CHECKPOINT
         with open(ruta, "wb") as f:
             pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
     
@@ -2335,9 +2703,33 @@ class SimulacionSatelites:
 
         Returns:
             Instancia restaurada de `SimulacionSatelites`.
+
+        Raises:
+            ValueError: si el checkpoint fue guardado con una versión
+                de esquema incompatible con el código actual.
         """
         with open(ruta, "rb") as f:
-            return pickle.load(f)
+            simulacion = pickle.load(f)
+        version_archivo = getattr(
+            simulacion, "_version_esquema_checkpoint", None
+        )
+        version_actual = SimulacionSatelites._VERSION_ESQUEMA_CHECKPOINT
+        if version_archivo != version_actual:
+            raise ValueError(
+                f"Checkpoint con esquema incompatible: el archivo fue "
+                f"guardado con versión {version_archivo!r} y el código "
+                f"actual espera la versión {version_actual}. Regenera el "
+                f"checkpoint con la versión actual del simulador."
+            )
+        # `Satellite._contador` es un atributo de clase y no se serializa
+        # con el checkpoint: al restaurarlo en un proceso nuevo arrancaria
+        # en 0 y los proximos satelites lanzados recibirian IDs ya usados
+        # (colision de IDs que romperia `pariente_id` y los linajes).
+        ids_existentes = [s.id for s in simulacion.satelites_activos]
+        ids_existentes += [s.id for s in simulacion.satelites_muertos]
+        if ids_existentes:
+            Satellite._contador = max(Satellite._contador, max(ids_existentes))
+        return simulacion
     
     def obtener_estadisticas_finales(self) -> Dict:
         """

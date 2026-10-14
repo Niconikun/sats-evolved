@@ -280,6 +280,59 @@ python -m pytest tests/ -v
 ```
 
 ## Historial de versiones
+### v1.4.0 (no publicado)
+- Fidelidad orbital: la anomalía media `M` se propaga cada paso de
+  tiempo (`dM = n·dt`, movimiento kepleriano) y el RAAN deriva por
+  precesión nodal J2 (`dOmega/dt = -3/2·J2·n·(Re/p)²·cos(i)`); ambos
+  efectos son vectorizados (`propagar_elementos_orbitales_batch`) y
+  desactivables vía `ConfiguracionFisica`
+  (`propagar_anomalia_media`, `precesion_j2_habilitada`).
+- Eclipses por ángulo beta: la recarga solar de cada satélite se
+  escala por la fracción del día fuera de la (pen)umbra terrestre,
+  estimada desde su inclinación, la declinación solar del día y su
+  altitud (`calcular_beta_rad`, `fraccion_dia_en_eclipse`). Nunca baja
+  de `fraccion_recarga_minima` (albedo). Desactivable con
+  `eclipses_habilitados`.
+- Constantes físicas nuevas: `J2_TIERRA` y `VEL_ANGULAR_TIERRA_SOL_RAD_S`.
+- Especiación alopátrica por banda orbital: la recombinación sexual
+  solo ocurre entre padres de la misma banda
+  (`aislamiento_reproductivo_por_banda`); sin pareja compatible cae a
+  reproducción asexual.
+- Costo de combustible en las maniobras de evasión de debris
+  (`costo_combustible_evasion_diario_pct`, proporcional a
+  `maniobrabilidad_evasiva`): el trade-off coevolutivo evitación vs.
+  longevidad de maniobras pasa a tener dientes.
+- Fitness de cobertura de banda (`peso_bono_cobertura_banda`): bono de
+  selección de padres para satélites cuya banda orbital está poco
+  representada entre los candidatos, complementando al bono de RAAN.
+- Detección del punto de no retorno de Kessler por banda
+  (`dias_sostenidos_punto_no_retorno`): la banda se declara en cascada
+  sostenida cuando el debris generado supera al decaído durante N
+  días consecutivos; queda registrado en
+  `sim.bandas_punto_no_retorno` y en el historial
+  (`bandas_punto_no_retorno`).
+- Mutación saltacional rara (`prob_mutacion_saltacional`): con
+  probabilidad baja por hijo, un rasgo heredable (calidad, agresividad
+  r/K, evasión) salta uniformemente a un valor nuevo del rango completo
+  en vez de mutar gaussianamente, permitiendo escapar de óptimos
+  locales. Aplica tanto a la vía asexual como al crossover.
+- Nuevo `sweep.py`: barrido de parámetros con exportación a CSV.
+  Corre la grilla cartesiana de configuraciones (mutación saltacional,
+  costo de evasión, bono de cobertura, umbral de no retorno) x
+  semillas, y exporta métricas finales de cada corrida (población,
+  calidad/evasión/agresividad promedio, colisiones, causas de muerte,
+  bandas en no retorno, costo de sostenibilidad). Uso:
+  `python sweep.py --dias 365 --semillas 3 --salida resultados.csv`.
+- Fixes: recarga solar configurable
+  (`ConfiguracionFisica.recarga_solar_diaria_pct`), la reentrada
+  orbital ya no genera debris derelicto, checkpoints versionados
+  (rechazo claro de esquemas incompatibles), `cargar_checkpoint`
+  restaura el contador de IDs, `probabilidad_colision_batch` usa el
+  mismo fallback de banda que la versión escalar, se eliminó el
+  parámetro muerto `ciclo_solar` de `calcular_lambda_total` y
+  `DistribucionFalla.probabilidad_falla_diaria` emite
+  `DeprecationWarning`. Añadido `requirements.txt`.
+
 
 ### v1.3.0
 - Nuevos mecanismos evolutivos a nivel de constelación en

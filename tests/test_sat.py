@@ -25,11 +25,16 @@ from sat import (
     CicloSolar,
     RadiacionCosmica,
     SimulacionSatelites,
+    DistribucionFalla,
     aplicar_drag_atmosferico_batch,
     aplicar_presion_radiacion_solar_batch,
     aplicar_radiacion_cosmica_batch,
     actualizar_metabolismo_batch,
     calcular_lambda_total_batch,
+    propagar_elementos_orbitales_batch,
+    fraccion_dia_en_eclipse,
+    calcular_beta_rad,
+    aplicar_costo_evasion_batch,
 )
 
 
@@ -133,6 +138,18 @@ class TestDebrisEspacial:
     def test_probabilidad_colision_batch_coincide_con_escalar(self, config):
         debris = DebrisEspacial(densidad_inicial=800, config=config)
         altitudes = np.array([150.0, 500.0, 1200.0, 5000.0, 40000.0, 300.0])
+
+        esperado = np.array([debris.probabilidad_colision(a) for a in altitudes])
+        obtenido = debris.probabilidad_colision_batch(altitudes)
+
+        np.testing.assert_allclose(obtenido, esperado)
+
+    def test_probabilidad_colision_batch_coincide_con_escalar_fuera_de_bandas(self, config):
+        # Las altitudes fuera de toda banda (negativas, por encima del
+        # tope GEO) deben usar el mismo fallback que la version escalar
+        # (_banda_de_altitud), no quedar con riesgo 0.
+        debris = DebrisEspacial(densidad_inicial=800, config=config)
+        altitudes = np.array([-50.0, -0.1, 0.0, 399.999, 2000.0, 35786.0, 1e9])
 
         esperado = np.array([debris.probabilidad_colision(a) for a in altitudes])
         obtenido = debris.probabilidad_colision_batch(altitudes)
@@ -263,11 +280,93 @@ class TestFuncionesBatch:
 
         lambda_batch = calcular_lambda_total_batch(poblacion, edades, riesgos_debris, config)
         lambda_escalar = np.array([
-            sat.calcular_lambda_total(edad, riesgo, ciclo_solar)
+            sat.calcular_lambda_total(edad, riesgo)
             for sat, edad, riesgo in zip(poblacion, edades, riesgos_debris)
         ])
 
         np.testing.assert_allclose(lambda_batch, lambda_escalar, rtol=1e-10)
+
+    def test_metabolismo_batch_respeta_recarga_solar_configurable(self, config, rng):
+        # La recarga solar (+10 por defecto) debe venir de la
+        # configuracion, no estar hardcodeada en la funcion batch.
+        # eclipses desactivados para probar solo la recarga configurable
+        config_recarga = ConfiguracionFisica(
+            recarga_solar_diaria_pct=20.0, eclipses_habilitados=False
+        )
+        poblacion = self._crear_poblacion(config_recarga, rng)
+        for sat in poblacion:
+            sat.energia = 50.0
+        actualizar_metabolismo_batch(poblacion, config_recarga)
+        # 50 + 20 de recarga - 5 de consumo
+        np.testing.assert_allclose(
+            np.array([s.energia for s in poblacion]), 65.0, rtol=1e-10
+        )
+
+
+    def test_propagacion_anomalia_media(self, config, rng):
+        # a=6771 km (400 km alt): n = sqrt(GM/a^3); tras 1 dia M avanza
+        # n*86400 en grados (mod 360).
+        sat = _crear_satelite(config, rng, a=6771.0)
+        M_inicial = sat.M
+        propagar_elementos_orbitales_batch([sat], 1.0, config)
+        n_rad_s = np.sqrt(config.gm_tierra_km3_s2 / 6771.0 ** 3)
+        esperado = (M_inicial + np.degrees(n_rad_s * 86400.0)) % 360.0
+        assert sat.M == pytest.approx(esperado, abs=1e-6)
+
+    def test_propagacion_respetada_como_opt_in(self, config, rng):
+        cfg_off = ConfiguracionFisica(propagar_anomalia_media=False,
+                                      precesion_j2_habilitada=False)
+        sat = _crear_satelite(config, rng, a=6771.0, Omega=42.0)
+        M_inicial, Omega_inicial = sat.M, sat.Omega
+        propagar_elementos_orbitales_batch([sat], 10.0, cfg_off)
+        assert sat.M == M_inicial
+        assert sat.Omega == Omega_inicial
+
+    def test_precesion_j2_iss(self, config, rng):
+        # ISS-like (i=51.6, a=6771): deriva del RAAN ~ -5 grados/dia.
+        sat = _crear_satelite(config, rng, a=6771.0, i=51.6, e=0.001, Omega=0.0)
+        propagar_elementos_orbitales_batch([sat], 1.0, config)
+        assert -5.5 < (sat.Omega - 360.0 if sat.Omega > 180 else sat.Omega) < -4.5
+
+    def test_precesion_j2_nula_en_orbita_polar(self, config, rng):
+        # cos(90)=0: una orbita polar no deriva su RAAN por J2.
+        sat = _crear_satelite(config, rng, a=6771.0, i=90.0, e=0.001, Omega=10.0)
+        propagar_elementos_orbitales_batch([sat], 365.0, config)
+        assert sat.Omega == pytest.approx(10.0, abs=1e-9)
+
+    def test_fraccion_eclipse_beta_cero_y_sin_eclipse(self, config):
+        # beta=0 y alt=400 km: fraccion = 2*rho_e/(2*pi) ~ 0.111
+        f = fraccion_dia_en_eclipse(0.0, 400.0, config)
+        rho = np.arccos(config.radio_tierra_km / (400.0 + config.radio_tierra_km)) \
+            + config.radio_angular_sol_rad
+        assert f == pytest.approx(2 * rho / (2 * np.pi), rel=1e-9)
+        assert 0.0 < f < 0.5
+        # beta mayor al angulo de eclipse: orbita siempre iluminada
+        assert fraccion_dia_en_eclipse(1.4, 400.0, config) == 0.0
+
+    def test_beta_maximo_en_solsticio(self, config):
+        # Solsticio (~dia 172), i=51.6: beta ~ 23.44*sin(51.6) = 18.3 deg.
+        beta = calcular_beta_rad(172, 51.6)
+        assert np.degrees(beta) == pytest.approx(18.3, abs=0.2)
+
+    def test_eclipses_reducen_recarga_solar(self, config, rng):
+        # Con eclipses activados, un satelite con beta pequeño recarga
+        # menos que uno en orbita siempre iluminada; nunca menos del piso.
+        cfg_ecl = ConfiguracionFisica(eclipses_habilitados=True)
+        sat_beta_bajo = _crear_satelite(config, rng, i=51.6)
+        sat_beta_bajo.energia = 50.0
+        actualizar_metabolismo_batch([sat_beta_bajo], cfg_ecl,
+                                     dias_transcurridos=100)
+        # recarga efectiva < nominal (10): energia < 50+10-5 = 55
+        assert sat_beta_bajo.energia < 55.0
+        assert sat_beta_bajo.energia > 50.0  # el piso evita quedarse a 0 de recarga
+        # Sin eclipses (control): recarga nominal completa
+        cfg_no_ecl = ConfiguracionFisica(eclipses_habilitados=False)
+        sat_control = _crear_satelite(config, rng, i=51.6)
+        sat_control.energia = 50.0
+        actualizar_metabolismo_batch([sat_control], cfg_no_ecl,
+                                     dias_transcurridos=100)
+        assert sat_control.energia == pytest.approx(55.0)
 
 
 # =============================================================================
@@ -346,6 +445,87 @@ class TestSimulacionSatelites:
         restaurado.ejecutar_simulacion(dias_totales=5)
         assert restaurado.dias_transcurridos == sim.dias_transcurridos + 5
 
+    def test_checkpoint_restaura_contador_de_ids(self, tmp_path):
+        # `Satellite._contador` es un atributo de clase y no viaja en el
+        # pickle de la simulacion: cargar un checkpoint en un proceso
+        # nuevo no debe reutilizar IDs ya asignados (romperia linajes).
+        sim = self._correr(semilla=57, dias=20)
+        ruta = tmp_path / "checkpoint_ids.pkl"
+        sim.guardar_checkpoint(str(ruta))
+
+        contador_previo = Satellite._contador
+        Satellite._contador = 0  # simula un proceso nuevo
+        try:
+            restaurado = SimulacionSatelites.cargar_checkpoint(str(ruta))
+            ids_existentes = {s.id for s in
+                               restaurado.satelites_activos + restaurado.satelites_muertos}
+            nuevos = restaurado.lanzar_satelites()
+            for sat in nuevos:
+                assert sat.id not in ids_existentes
+            assert Satellite._contador >= max(ids_existentes)
+        finally:
+            Satellite._contador = contador_previo
+
+    def test_ejecutar_simulacion_parametro_heredables(self):
+        # El README documenta `ejecutar_simulacion(..., heredables=...)`;
+        # debe sobrescribir reproductor_habilitado durante la ejecucion.
+        sim = SimulacionSatelites(
+            tiempo_inicio=datetime(2024, 1, 1), semilla=61,
+            reproductor_habilitado=True,
+        )
+        sim.lanzar_satelites()
+        sim.ejecutar_simulacion(dias_totales=10, heredables=False)
+        assert sim.reproductor_habilitado is False
+
+        sim2 = SimulacionSatelites(
+            tiempo_inicio=datetime(2024, 1, 1), semilla=62,
+            reproductor_habilitado=False,
+        )
+        sim2.lanzar_satelites()
+        sim2.ejecutar_simulacion(dias_totales=10, heredables=True)
+        assert sim2.reproductor_habilitado is True
+
+    def test_reentrada_orbital_no_genera_debris(self):
+        # Un satelite que reentra se desintegra en la atmosfera: no debe
+        # dejar un derelicto en su banda orbital como las otras causas.
+        sim = SimulacionSatelites(
+            tiempo_inicio=datetime(2024, 1, 1), semilla=63,
+            intervalo_lanzamiento_dias=1000,  # sin lanzamientos nuevos
+        )
+        sim.lanzar_satelites()
+        debris_antes = sim.debris.densidad
+        for sat in sim.satelites_activos:
+            sat.a = sim.config.radio_tierra_km + 50.0  # fuerza reentrada
+        sim.paso_tiempo(1)
+        reentrados = [s for s in sim.satelites_muertos
+                      if s.causa_muerte == "reentrada_orbital"]
+        assert len(reentrados) > 0
+        assert sim.debris.densidad <= debris_antes
+
+
+    def test_checkpoint_rechaza_esquema_incompatible(self, tmp_path):
+        # Un checkpoint guardado con otra version de esquema debe
+        # rechazarse con un error claro, no fallar de forma
+        # impredecible al deserializar.
+        sim = self._correr(semilla=71, dias=10)
+        ruta = tmp_path / "checkpoint_bad.pkl"
+        sim.guardar_checkpoint(str(ruta))
+        with open(ruta, "rb") as f:
+            objeto = pickle.load(f)
+        objeto._version_esquema_checkpoint = (
+            SimulacionSatelites._VERSION_ESQUEMA_CHECKPOINT + 1
+        )
+        with open(ruta, "wb") as f:
+            pickle.dump(objeto, f)
+        with pytest.raises(ValueError, match="esquema incompatible"):
+            SimulacionSatelites.cargar_checkpoint(str(ruta))
+
+    def test_distribucion_falla_legacy_emite_deprecation_warning(self):
+        # DistribucionFalla.probabilidad_falla_diaria es legacy: el
+        # motor usa Satellite.calcular_lambda_total (tasas aditivas).
+        with pytest.warns(DeprecationWarning, match="deprecado"):
+            DistribucionFalla().probabilidad_falla_diaria(100.0)
+
     def test_checkpoint_es_picklable_directamente(self):
         sim = self._correr(semilla=3, dias=10)
         datos = pickle.dumps(sim)
@@ -395,6 +575,126 @@ class TestSimulacionSatelites:
 # =============================================================================
 
 class TestMecanismosEvolutivosConstelacion:
+    def test_costo_evasion_consume_combustible(self, config, rng):
+        # Evadir debris cuesta combustible proporcional a la capacidad
+        # de evasion; bajo el umbral de combustible no hay maniobra ni costo.
+        sat = _crear_satelite(config, rng, maniobrabilidad_evasiva=1.0,
+                              combustible=50.0)
+        aplicar_costo_evasion_batch([sat], config)
+        assert sat.combustible == pytest.approx(
+            50.0 - config.costo_combustible_evasion_diario_pct
+        )
+        sat_bajo = _crear_satelite(config, rng, maniobrabilidad_evasiva=1.0,
+                                   combustible=config.umbral_combustible_bajo_pct - 1.0)
+        aplicar_costo_evasion_batch([sat_bajo], config)
+        assert sat_bajo.combustible == pytest.approx(
+            config.umbral_combustible_bajo_pct - 1.0
+        )
+
+    def test_bono_cobertura_banda_favorece_nicho_minoritario(self):
+        # Satelites de la banda minoritaria entre los candidatos deben
+        # recibir un bono mayor que los de la banda dominante.
+        sim = SimulacionSatelites(
+            tiempo_inicio=datetime(2024, 1, 1), semilla=91,
+            satelites_por_lanzamiento=5,
+        )
+        sim.lanzar_satelites()
+        # Forzar candidatos de dos bandas: 2 LEO + 1 MEO
+        cands = sim.satelites_activos[:3]
+        cands[0].a = sim.config.radio_tierra_km + 800.0
+        cands[1].a = sim.config.radio_tierra_km + 800.0
+        cands[2].a = sim.config.radio_tierra_km + 5000.0
+        bonos = sim._bono_cobertura_banda(cands)
+        assert bonos[2] > bonos[0] == bonos[1]
+        # Con peso 0 el bono queda desactivado
+        cfg_off = ConfiguracionFisica(peso_bono_cobertura_banda=0.0)
+        sim.config = cfg_off
+        assert np.all(sim._bono_cobertura_banda(cands) == 1.0)
+
+    def test_especiacion_aislamiento_reproductivo_por_banda(self):
+        # Con prob_reproduccion_sexual=1 y aislamiento activo, todo hijo
+        # con 2 padres debe tener padres de la misma banda orbital.
+        sim = SimulacionSatelites(
+            tiempo_inicio=datetime(2024, 1, 1), semilla=92,
+            satelites_por_lanzamiento=20, prob_reproduccion_sexual=1.0,
+        )
+        sim.lanzar_satelites()
+        sim.ejecutar_simulacion(dias_totales=90)
+        todos = {s.id: s for s in sim.satelites_activos + sim.satelites_muertos}
+        con_dos_padres = [s for s in todos.values()
+                          if s.pariente_id_secundario is not None]
+        assert con_dos_padres, "deberia haber hijos sexuales en 90 dias"
+        for hijo in con_dos_padres:
+            p1 = todos.get(hijo.pariente_id)
+            p2 = todos.get(hijo.pariente_id_secundario)
+            if p1 is None or p2 is None:
+                continue  # padre ya no rastreable (checkpoint parcial)
+            banda1 = sim.debris.banda_de_altitud(p1.altitud_km())
+            banda2 = sim.debris.banda_de_altitud(p2.altitud_km())
+            assert banda1 == banda2
+
+    def test_punto_no_retorno_kessler(self):
+        # Con cascada sostenida (riesgo > 1 durante N dias consecutivos),
+        # la banda se declara en punto de no retorno y queda registrada.
+        cfg = ConfiguracionFisica(dias_sostenidos_punto_no_retorno=3)
+        sim = SimulacionSatelites(
+            tiempo_inicio=datetime(2024, 1, 1), semilla=93,
+            satelites_por_lanzamiento=60, intervalo_lanzamiento_dias=5,
+            config=cfg,
+        )
+        sim.lanzar_satelites()
+        # Forzar una cascada: debris enorme en LEO genera colisiones
+        # diarias sostenidas.
+        sim.debris.densidad_por_banda["leo_congestionado"] = 5000.0
+        sim.ejecutar_simulacion(dias_totales=40)
+        assert "leo_congestionado" in sim.bandas_punto_no_retorno
+        assert "leo_congestionado" in sim.historial[-1]["bandas_punto_no_retorno"]
+
+    def test_mutacion_saltacional_rara(self, config, rng):
+        # Con prob 1.0, todo hijo asexual sufre un salto en un rasgo
+        # (uniforme en el rango completo); con prob 0.0, nunca.
+        cfg_salto = ConfiguracionFisica(prob_mutacion_saltacional=1.0)
+        padre = _crear_satelite(
+            config, rng, calidad_inherente=0.9,
+            agresividad_reproductiva=0.9, maniobrabilidad_evasiva=0.9,
+        )
+        padre.config = cfg_salto
+        rasgos_saltales = 0
+        for _ in range(60):
+            hijo = padre.crear_hijo(datetime(2024, 1, 2), rng=rng)
+            if (hijo.calidad_inherente < 0.75
+                    or hijo.agresividad_reproductiva < 0.75
+                    or hijo.maniobrabilidad_evasiva < 0.75):
+                rasgos_saltales += 1
+        assert rasgos_saltales > 30  # con prob 1.0, la mayoria salta lejos
+        cfg_cero = ConfiguracionFisica(prob_mutacion_saltacional=0.0)
+        padre.config = cfg_cero
+        for _ in range(60):
+            hijo = padre.crear_hijo(datetime(2024, 1, 2), rng=rng)
+            # sin saltos: los tres rasgos quedan cerca del parental
+            assert hijo.calidad_inherente > 0.75
+            assert hijo.agresividad_reproductiva > 0.75
+            assert hijo.maniobrabilidad_evasiva > 0.75
+
+    def test_mutacion_saltacional_en_via_sexual(self, config, rng):
+        # Igual que la via asexual: el salto tambien aplica al crossover.
+        cfg_salto = ConfiguracionFisica(prob_mutacion_saltacional=1.0)
+        p1 = _crear_satelite(config, rng, calidad_inherente=0.9,
+                             agresividad_reproductiva=0.9,
+                             maniobrabilidad_evasiva=0.9)
+        p2 = _crear_satelite(config, rng, calidad_inherente=0.9,
+                             agresividad_reproductiva=0.9,
+                             maniobrabilidad_evasiva=0.9)
+        p1.config = p2.config = cfg_salto
+        saltos = 0
+        for _ in range(60):
+            hijo = p1.crear_hijo_sexual(p2, datetime(2024, 1, 2), rng=rng)
+            if (hijo.calidad_inherente < 0.75
+                    or hijo.agresividad_reproductiva < 0.75
+                    or hijo.maniobrabilidad_evasiva < 0.75):
+                saltos += 1
+        assert saltos > 30
+
     def test_fitness_reproductivo_es_calidad_inherente(self, config, rng):
         sat = _crear_satelite(config, rng, calidad_inherente=0.83)
         assert sat.fitness_reproductivo() == pytest.approx(0.83)
@@ -445,8 +745,8 @@ class TestMecanismosEvolutivosConstelacion:
             config, rng, calidad_inherente=0.5,
             maniobrabilidad_evasiva=1.0, combustible=100.0
         )
-        lam_sin = sat_sin_evasion.calcular_lambda_total(100, 0.05, ciclo_solar)
-        lam_con = sat_con_evasion.calcular_lambda_total(100, 0.05, ciclo_solar)
+        lam_sin = sat_sin_evasion.calcular_lambda_total(100, 0.05)
+        lam_con = sat_con_evasion.calcular_lambda_total(100, 0.05)
         assert lam_con < lam_sin
 
     def test_evasion_no_reduce_lambda_sin_combustible(self, config, rng):
@@ -460,8 +760,8 @@ class TestMecanismosEvolutivosConstelacion:
             config, rng, calidad_inherente=0.5,
             maniobrabilidad_evasiva=1.0, combustible=combustible_bajo
         )
-        lam_sin = sat_sin_evasion.calcular_lambda_total(100, 0.05, ciclo_solar)
-        lam_con = sat_con_evasion.calcular_lambda_total(100, 0.05, ciclo_solar)
+        lam_sin = sat_sin_evasion.calcular_lambda_total(100, 0.05)
+        lam_con = sat_con_evasion.calcular_lambda_total(100, 0.05)
         # Sin combustible suficiente para maniobrar, el rasgo de evasión
         # no tiene efecto (mismo lambda con o sin el rasgo).
         assert lam_con == pytest.approx(lam_sin)
