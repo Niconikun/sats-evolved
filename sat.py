@@ -166,6 +166,11 @@ class ConfiguracionFisica:
     # (0 = desactivado; el bono escala hasta 1 + peso para el nicho menos
     # poblado).
     peso_bono_cobertura_banda: float = 0.5
+    # Mutación "saltacional" rara: con esta probabilidad por hijo, un rasgo
+    # heredable (calidad, agresividad r/K, evasión) salta uniformemente a
+    # un valor nuevo del rango completo en vez de mutar gaussianamente.
+    # Permite escapar de óptimos locales en el paisaje evolutivo.
+    prob_mutacion_saltacional: float = 0.01
     # Días consecutivos con riesgo de cascada > 1 (debris generado >
     # decaído) en una banda para declarar el "punto de no retorno" de
     # Kessler en esa banda.
@@ -1171,6 +1176,19 @@ class Satellite:
         evasion_hijo = np.clip(
             self.maniobrabilidad_evasiva + rng_efectivo.normal(0, 0.05), 0.0, 1.0
         )
+
+        # Mutación saltacional rara: con prob
+        # `prob_mutacion_saltacional`, un rasgo salta uniformemente a un
+        # valor nuevo del rango completo (escapa de óptimos locales).
+        p_salto = self.config.prob_mutacion_saltacional
+        if p_salto > 0 and rng_efectivo.random() < p_salto:
+            rasgo_salto = rng_efectivo.integers(0, 3)
+            if rasgo_salto == 0:
+                calidad_hijo = float(rng_efectivo.uniform(0.1, 1.0))
+            elif rasgo_salto == 1:
+                agresividad_hijo = float(rng_efectivo.uniform(0.0, 1.0))
+            else:
+                evasion_hijo = float(rng_efectivo.uniform(0.0, 1.0))
         
         # El hijo hereda propiedades físicas
         combustible_hijo = self.combustible * 0.9
@@ -1238,6 +1256,19 @@ class Satellite:
         evasion_hijo = np.clip(
             combinar(self.maniobrabilidad_evasiva, otro_padre.maniobrabilidad_evasiva), 0.0, 1.0
         )
+
+        # Mutación saltacional rara (igual que en la vía asexual):
+        # con prob `prob_mutacion_saltacional`, un rasgo salta
+        # uniformemente a un valor nuevo del rango completo.
+        p_salto = self.config.prob_mutacion_saltacional
+        if p_salto > 0 and rng_efectivo.random() < p_salto:
+            rasgo_salto = rng_efectivo.integers(0, 3)
+            if rasgo_salto == 0:
+                calidad_hijo = float(rng_efectivo.uniform(0.1, 1.0))
+            elif rasgo_salto == 1:
+                agresividad_hijo = float(rng_efectivo.uniform(0.0, 1.0))
+            else:
+                evasion_hijo = float(rng_efectivo.uniform(0.0, 1.0))
 
         combustible_hijo = (self.combustible + otro_padre.combustible) / 2 * 0.9
         energia_hijo = (self.energia + otro_padre.energia) / 2 * 0.9

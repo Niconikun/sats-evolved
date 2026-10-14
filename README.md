@@ -311,6 +311,18 @@ python -m pytest tests/ -v
   días consecutivos; queda registrado en
   `sim.bandas_punto_no_retorno` y en el historial
   (`bandas_punto_no_retorno`).
+- Mutación saltacional rara (`prob_mutacion_saltacional`): con
+  probabilidad baja por hijo, un rasgo heredable (calidad, agresividad
+  r/K, evasión) salta uniformemente a un valor nuevo del rango completo
+  en vez de mutar gaussianamente, permitiendo escapar de óptimos
+  locales. Aplica tanto a la vía asexual como al crossover.
+- Nuevo `sweep.py`: barrido de parámetros con exportación a CSV.
+  Corre la grilla cartesiana de configuraciones (mutación saltacional,
+  costo de evasión, bono de cobertura, umbral de no retorno) x
+  semillas, y exporta métricas finales de cada corrida (población,
+  calidad/evasión/agresividad promedio, colisiones, causas de muerte,
+  bandas en no retorno, costo de sostenibilidad). Uso:
+  `python sweep.py --dias 365 --semillas 3 --salida resultados.csv`.
 - Fixes: recarga solar configurable
   (`ConfiguracionFisica.recarga_solar_diaria_pct`), la reentrada
   orbital ya no genera debris derelicto, checkpoints versionados

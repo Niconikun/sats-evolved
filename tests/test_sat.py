@@ -650,6 +650,51 @@ class TestMecanismosEvolutivosConstelacion:
         assert "leo_congestionado" in sim.bandas_punto_no_retorno
         assert "leo_congestionado" in sim.historial[-1]["bandas_punto_no_retorno"]
 
+    def test_mutacion_saltacional_rara(self, config, rng):
+        # Con prob 1.0, todo hijo asexual sufre un salto en un rasgo
+        # (uniforme en el rango completo); con prob 0.0, nunca.
+        cfg_salto = ConfiguracionFisica(prob_mutacion_saltacional=1.0)
+        padre = _crear_satelite(
+            config, rng, calidad_inherente=0.9,
+            agresividad_reproductiva=0.9, maniobrabilidad_evasiva=0.9,
+        )
+        padre.config = cfg_salto
+        rasgos_saltales = 0
+        for _ in range(60):
+            hijo = padre.crear_hijo(datetime(2024, 1, 2), rng=rng)
+            if (hijo.calidad_inherente < 0.75
+                    or hijo.agresividad_reproductiva < 0.75
+                    or hijo.maniobrabilidad_evasiva < 0.75):
+                rasgos_saltales += 1
+        assert rasgos_saltales > 30  # con prob 1.0, la mayoria salta lejos
+        cfg_cero = ConfiguracionFisica(prob_mutacion_saltacional=0.0)
+        padre.config = cfg_cero
+        for _ in range(60):
+            hijo = padre.crear_hijo(datetime(2024, 1, 2), rng=rng)
+            # sin saltos: los tres rasgos quedan cerca del parental
+            assert hijo.calidad_inherente > 0.75
+            assert hijo.agresividad_reproductiva > 0.75
+            assert hijo.maniobrabilidad_evasiva > 0.75
+
+    def test_mutacion_saltacional_en_via_sexual(self, config, rng):
+        # Igual que la via asexual: el salto tambien aplica al crossover.
+        cfg_salto = ConfiguracionFisica(prob_mutacion_saltacional=1.0)
+        p1 = _crear_satelite(config, rng, calidad_inherente=0.9,
+                             agresividad_reproductiva=0.9,
+                             maniobrabilidad_evasiva=0.9)
+        p2 = _crear_satelite(config, rng, calidad_inherente=0.9,
+                             agresividad_reproductiva=0.9,
+                             maniobrabilidad_evasiva=0.9)
+        p1.config = p2.config = cfg_salto
+        saltos = 0
+        for _ in range(60):
+            hijo = p1.crear_hijo_sexual(p2, datetime(2024, 1, 2), rng=rng)
+            if (hijo.calidad_inherente < 0.75
+                    or hijo.agresividad_reproductiva < 0.75
+                    or hijo.maniobrabilidad_evasiva < 0.75):
+                saltos += 1
+        assert saltos > 30
+
     def test_fitness_reproductivo_es_calidad_inherente(self, config, rng):
         sat = _crear_satelite(config, rng, calidad_inherente=0.83)
         assert sat.fitness_reproductivo() == pytest.approx(0.83)
