@@ -294,6 +294,23 @@ python -m pytest tests/ -v
   de `fraccion_recarga_minima` (albedo). Desactivable con
   `eclipses_habilitados`.
 - Constantes físicas nuevas: `J2_TIERRA` y `VEL_ANGULAR_TIERRA_SOL_RAD_S`.
+- Especiación alopátrica por banda orbital: la recombinación sexual
+  solo ocurre entre padres de la misma banda
+  (`aislamiento_reproductivo_por_banda`); sin pareja compatible cae a
+  reproducción asexual.
+- Costo de combustible en las maniobras de evasión de debris
+  (`costo_combustible_evasion_diario_pct`, proporcional a
+  `maniobrabilidad_evasiva`): el trade-off coevolutivo evitación vs.
+  longevidad de maniobras pasa a tener dientes.
+- Fitness de cobertura de banda (`peso_bono_cobertura_banda`): bono de
+  selección de padres para satélites cuya banda orbital está poco
+  representada entre los candidatos, complementando al bono de RAAN.
+- Detección del punto de no retorno de Kessler por banda
+  (`dias_sostenidos_punto_no_retorno`): la banda se declara en cascada
+  sostenida cuando el debris generado supera al decaído durante N
+  días consecutivos; queda registrado en
+  `sim.bandas_punto_no_retorno` y en el historial
+  (`bandas_punto_no_retorno`).
 - Fixes: recarga solar configurable
   (`ConfiguracionFisica.recarga_solar_diaria_pct`), la reentrada
   orbital ya no genera debris derelicto, checkpoints versionados

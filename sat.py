@@ -148,6 +148,28 @@ class ConfiguracionFisica:
     # satélite con `maniobrabilidad_evasiva` = 1.0 y combustible
     # suficiente para maniobrar (ver Satellite.calcular_lambda_total).
     factor_reduccion_evasion_max: float = 0.7
+    # Costo diario de combustible (puntos porcentuales) de las
+    # maniobras de evasión de debris, proporcional a
+    # `maniobrabilidad_evasiva` y solo cuando hay combustible sobre el
+    # umbral (trade-off evitación vs. longevidad de maniobras).
+    costo_combustible_evasion_diario_pct: float = 0.1
+    # =========================================================================
+    # ESPECIACIÓN Y COBERTURA (Fase: ecología de la constelación)
+    # =========================================================================
+    # Aislamiento reproductivo por banda orbital (especiación alopátrica):
+    # la recombinación sexual solo puede ocurrir entre padres de la misma
+    # banda orbital; si no hay pareja compatible, cae a reproducción
+    # asexual del padre sorteado.
+    aislamiento_reproductivo_por_banda: bool = True
+    # Peso del bono de fitness de cobertura de banda: satélites cuya banda
+    # orbital está poco representada entre los candidatos reciben un bono
+    # (0 = desactivado; el bono escala hasta 1 + peso para el nicho menos
+    # poblado).
+    peso_bono_cobertura_banda: float = 0.5
+    # Días consecutivos con riesgo de cascada > 1 (debris generado >
+    # decaído) en una banda para declarar el "punto de no retorno" de
+    # Kessler en esa banda.
+    dias_sostenidos_punto_no_retorno: int = 30
 
     # Estrategias r/K (trade-off reproducción vs. longevidad): umbrales de
     # energía/combustible para calificar como candidato a reproducirse,
@@ -1556,6 +1578,33 @@ def actualizar_metabolismo_batch(satelites: List['Satellite'],
     return energia_arr <= 0
 
 
+def aplicar_costo_evasion_batch(satelites: List['Satellite'],
+                               config: ConfiguracionFisica) -> None:
+    """
+    Cobra el costo diario de combustible de las maniobras de evasión de
+    debris, proporcional a `maniobrabilidad_evasiva` y solo para
+    satélites con combustible sobre el umbral (Fase: coevolución con
+    costo). Muta `combustible` de cada satélite in-place.
+    Introducir el costo en una fase separada de `calcular_lambda_total`
+    (que es de solo-lectura, igual que su versión batch) preserva la
+    equivalencia batch/escalar verificada por los tests.
+    Args:
+        satelites: lista de satélites a actualizar.
+        config: configuración física compartida.
+    """
+    if not satelites:
+        return
+    umbral = config.umbral_combustible_bajo_pct
+    for sat in satelites:
+        if sat.combustible >= umbral:
+            sat.combustible = max(
+                0.0,
+                sat.combustible
+                - config.costo_combustible_evasion_diario_pct
+                * sat.maniobrabilidad_evasiva,
+            )
+
+
 def calcular_lambda_total_batch(satelites: List['Satellite'], edades_dias: np.ndarray,
                                 riesgos_debris: np.ndarray,
                                 config: ConfiguracionFisica) -> np.ndarray:
@@ -1840,6 +1889,13 @@ class SimulacionSatelites:
         
         # Tracking de causas de muerte acumuladas (para visualización)
         self.causas_muerte_acumuladas: Dict[str, int] = {}
+
+        # Detección del punto de no retorno de Kessler por banda orbital:
+        # días consecutivos con riesgo de cascada > 1, y bandas que ya
+        # cruzaron el umbral sostenido (una vez cruzado, es permanente
+        # para la corrida: la cascada se autoabastece).
+        self._dias_cascada_sostenida: Dict[str, int] = {}
+        self.bandas_punto_no_retorno: set = set()
         
         # Mitigación de debris: pasivación + desorbitado controlado
         self.desorbitado_controlado_habilitado = desorbitado_controlado_habilitado
@@ -1982,7 +2038,38 @@ class SimulacionSatelites:
         """
         pesos_fitness = np.array([c.fitness_reproductivo() for c in candidatos])
         bono_diversidad = self._bono_diversidad_orbital(candidatos)
-        return pesos_fitness * bono_diversidad
+        return pesos_fitness * bono_diversidad * self._bono_cobertura_banda(candidatos)
+
+    def _bono_cobertura_banda(self, candidatos: List[Satellite]) -> np.ndarray:
+        """
+        Bono de fitness de cobertura de banda orbital (selección de
+        nicho a nivel de constelación, complementario al bono de RAAN):
+        satélites cuya banda orbital ("bajo", "leo_congestionado", "meo",
+        "geo") está menos representada entre los candidatos reciben un
+        bono mayor, favoreciendo que la reproducción pueble nichos de
+        altitud poco cubiertos en vez de concentrarse en la banda dominante.
+        El bono del nicho menos poblado escala hasta
+        `1 + peso_bono_cobertura_banda` (y hasta 1.0 para el más poblado);
+        con `peso_bono_cobertura_banda` = 0 queda desactivado.
+        Args:
+            candidatos: lista de satélites candidatos a reproducirse.
+        Returns:
+            Array de bonos positivos (mismo orden que `candidatos`).
+        """
+        peso = self.config.peso_bono_cobertura_banda
+        n = len(candidatos)
+        if peso <= 0.0 or n <= 1:
+            return np.ones(n)
+        bandas = [self.debris.banda_de_altitud(c.altitud_km()) for c in candidatos]
+        conteo: Dict[str, int] = {}
+        for banda in bandas:
+            conteo[banda] = conteo.get(banda, 0) + 1
+        max_conteo = max(conteo.values())
+        bono_por_banda = {
+            banda: 1.0 + peso * (1.0 - conteo[banda] / max_conteo)
+            for banda in conteo
+        }
+        return np.array([bono_por_banda[b] for b in bandas])
     
     def _probabilidad_reproduccion_exitosa(self, padre: Satellite) -> float:
         """
@@ -2055,16 +2142,29 @@ class SimulacionSatelites:
                     if self.rng.random() > self._probabilidad_reproduccion_exitosa(padre):
                         continue  # intento fallido por saturación orbital
 
-                    # 3. Recombinación sexual (crossover) vs. asexual
+                    # 3. Recombinación sexual (crossover) vs. asexual,
+                    #    con aislamiento reproductivo por banda orbital
+                    #    (especiación alopátrica): el segundo padre debe
+                    #    pertenecer a la misma banda que el primero; si no
+                    #    hay pareja compatible, cae a asexual.
                     if (len(padres_candidatos) > 1 and
                             self.rng.random() < self.prob_reproduccion_sexual):
-                        idx_padre2 = self.rng.choice(len(padres_candidatos), p=probabilidades)
-                        intentos = 0
-                        while idx_padre2 == idx_padre and intentos < 5:
-                            idx_padre2 = self.rng.choice(len(padres_candidatos), p=probabilidades)
-                            intentos += 1
-                        if idx_padre2 != idx_padre:
-                            padre2 = padres_candidatos[idx_padre2]
+                        if self.config.aislamiento_reproductivo_por_banda:
+                            banda_padre = self.debris.banda_de_altitud(padre.altitud_km())
+                            compatibles = [
+                                idx for idx, cand in enumerate(padres_candidatos)
+                                if idx != idx_padre
+                                and self.debris.banda_de_altitud(cand.altitud_km()) == banda_padre
+                            ]
+                        else:
+                            compatibles = [
+                                idx for idx in range(len(padres_candidatos))
+                                if idx != idx_padre
+                            ]
+                        if compatibles:
+                            prob_pareja = probabilidades[compatibles] / probabilidades[compatibles].sum()
+                            idx_padre2 = int(self.rng.choice(len(compatibles), p=prob_pareja))
+                            padre2 = padres_candidatos[compatibles[idx_padre2]]
                             hijo = padre.crear_hijo_sexual(
                                 padre2, self.tiempo_actual, self.tasa_mutacion, rng=self.rng
                             )
@@ -2224,6 +2324,12 @@ class SimulacionSatelites:
             satelites_supervivientes.append(sat)
 
         self.satelites_activos = satelites_supervivientes
+
+        # Costo diario de combustible de las maniobras de evasión
+        # (coevolución con costo: evadir debris gasta longevidad de
+        # maniobras). Fase separada del cálculo de lambda, que es de
+        # solo-lectura.
+        aplicar_costo_evasion_batch(self.satelites_activos, self.config)
     
     def actualizar_sistemas_ambientales(self):
         """
@@ -2336,6 +2442,22 @@ class SimulacionSatelites:
             
             # Decaimiento natural del debris + riesgo de cascada del día
             riesgo_cascada = self.debris.aplicar_decaimiento_diario()
+
+            # Detección del "punto de no retorno" de Kessler por banda:
+            # la banda entra en cascada sostenida cuando el debris
+            # generado supera al decaído (riesgo > 1) durante
+            # `dias_sostenidos_punto_no_retorno` días consecutivos.
+            for banda, riesgo in riesgo_cascada.items():
+                if riesgo > 1.0:
+                    self._dias_cascada_sostenida[banda] = (
+                        self._dias_cascada_sostenida.get(banda, 0) + 1
+                    )
+                else:
+                    self._dias_cascada_sostenida[banda] = 0
+                if (banda not in self.bandas_punto_no_retorno
+                        and self._dias_cascada_sostenida[banda]
+                        >= self.config.dias_sostenidos_punto_no_retorno):
+                    self.bandas_punto_no_retorno.add(banda)
             
             # Remoción activa de debris (ADR), si está habilitada
             if self.adr_habilitado and self.adr_tasa_remocion_anual > 0:
@@ -2368,6 +2490,7 @@ class SimulacionSatelites:
                 for banda in self.debris.densidad_por_banda
             },
             'riesgo_cascada': riesgo_cascada,
+            'bandas_punto_no_retorno': sorted(self.bandas_punto_no_retorno),
             'colisiones_totales': self.debris.colisiones_totales,
             'edad_promedio_dias': edad_promedio,
             'energia_promedio': energia_promedio,

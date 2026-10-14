@@ -34,6 +34,7 @@ from sat import (
     propagar_elementos_orbitales_batch,
     fraccion_dia_en_eclipse,
     calcular_beta_rad,
+    aplicar_costo_evasion_batch,
 )
 
 
@@ -574,6 +575,81 @@ class TestSimulacionSatelites:
 # =============================================================================
 
 class TestMecanismosEvolutivosConstelacion:
+    def test_costo_evasion_consume_combustible(self, config, rng):
+        # Evadir debris cuesta combustible proporcional a la capacidad
+        # de evasion; bajo el umbral de combustible no hay maniobra ni costo.
+        sat = _crear_satelite(config, rng, maniobrabilidad_evasiva=1.0,
+                              combustible=50.0)
+        aplicar_costo_evasion_batch([sat], config)
+        assert sat.combustible == pytest.approx(
+            50.0 - config.costo_combustible_evasion_diario_pct
+        )
+        sat_bajo = _crear_satelite(config, rng, maniobrabilidad_evasiva=1.0,
+                                   combustible=config.umbral_combustible_bajo_pct - 1.0)
+        aplicar_costo_evasion_batch([sat_bajo], config)
+        assert sat_bajo.combustible == pytest.approx(
+            config.umbral_combustible_bajo_pct - 1.0
+        )
+
+    def test_bono_cobertura_banda_favorece_nicho_minoritario(self):
+        # Satelites de la banda minoritaria entre los candidatos deben
+        # recibir un bono mayor que los de la banda dominante.
+        sim = SimulacionSatelites(
+            tiempo_inicio=datetime(2024, 1, 1), semilla=91,
+            satelites_por_lanzamiento=5,
+        )
+        sim.lanzar_satelites()
+        # Forzar candidatos de dos bandas: 2 LEO + 1 MEO
+        cands = sim.satelites_activos[:3]
+        cands[0].a = sim.config.radio_tierra_km + 800.0
+        cands[1].a = sim.config.radio_tierra_km + 800.0
+        cands[2].a = sim.config.radio_tierra_km + 5000.0
+        bonos = sim._bono_cobertura_banda(cands)
+        assert bonos[2] > bonos[0] == bonos[1]
+        # Con peso 0 el bono queda desactivado
+        cfg_off = ConfiguracionFisica(peso_bono_cobertura_banda=0.0)
+        sim.config = cfg_off
+        assert np.all(sim._bono_cobertura_banda(cands) == 1.0)
+
+    def test_especiacion_aislamiento_reproductivo_por_banda(self):
+        # Con prob_reproduccion_sexual=1 y aislamiento activo, todo hijo
+        # con 2 padres debe tener padres de la misma banda orbital.
+        sim = SimulacionSatelites(
+            tiempo_inicio=datetime(2024, 1, 1), semilla=92,
+            satelites_por_lanzamiento=20, prob_reproduccion_sexual=1.0,
+        )
+        sim.lanzar_satelites()
+        sim.ejecutar_simulacion(dias_totales=90)
+        todos = {s.id: s for s in sim.satelites_activos + sim.satelites_muertos}
+        con_dos_padres = [s for s in todos.values()
+                          if s.pariente_id_secundario is not None]
+        assert con_dos_padres, "deberia haber hijos sexuales en 90 dias"
+        for hijo in con_dos_padres:
+            p1 = todos.get(hijo.pariente_id)
+            p2 = todos.get(hijo.pariente_id_secundario)
+            if p1 is None or p2 is None:
+                continue  # padre ya no rastreable (checkpoint parcial)
+            banda1 = sim.debris.banda_de_altitud(p1.altitud_km())
+            banda2 = sim.debris.banda_de_altitud(p2.altitud_km())
+            assert banda1 == banda2
+
+    def test_punto_no_retorno_kessler(self):
+        # Con cascada sostenida (riesgo > 1 durante N dias consecutivos),
+        # la banda se declara en punto de no retorno y queda registrada.
+        cfg = ConfiguracionFisica(dias_sostenidos_punto_no_retorno=3)
+        sim = SimulacionSatelites(
+            tiempo_inicio=datetime(2024, 1, 1), semilla=93,
+            satelites_por_lanzamiento=60, intervalo_lanzamiento_dias=5,
+            config=cfg,
+        )
+        sim.lanzar_satelites()
+        # Forzar una cascada: debris enorme en LEO genera colisiones
+        # diarias sostenidas.
+        sim.debris.densidad_por_banda["leo_congestionado"] = 5000.0
+        sim.ejecutar_simulacion(dias_totales=40)
+        assert "leo_congestionado" in sim.bandas_punto_no_retorno
+        assert "leo_congestionado" in sim.historial[-1]["bandas_punto_no_retorno"]
+
     def test_fitness_reproductivo_es_calidad_inherente(self, config, rng):
         sat = _crear_satelite(config, rng, calidad_inherente=0.83)
         assert sat.fitness_reproductivo() == pytest.approx(0.83)
