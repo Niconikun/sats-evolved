@@ -428,12 +428,25 @@ class DebrisEspacial:
         """
         altitudes = np.asarray(altitudes_km, dtype=float)
         resultado = np.zeros_like(altitudes)
+        procesadas = np.zeros(altitudes.shape, dtype=bool)
         for banda, alt_min, alt_max, _ in self._BANDAS:
             mascara = (altitudes >= alt_min) & (altitudes < alt_max)
             riesgo_banda = min(
                 self._RIESGO_BASE[banda] * self.densidad_normalizada_banda(banda), 0.1
             )
             resultado[mascara] = riesgo_banda
+            procesadas |= mascara
+        # Igual que en la version escalar (_banda_de_altitud), las
+        # altitudes fuera de toda banda (p. ej. negativas por un semieje
+        # degradado) usan la ultima banda como fallback, en vez de
+        # quedar con riesgo 0 y divergir de la version escalar.
+        banda_fallback = self._BANDAS[-1][0]
+        riesgo_fallback = min(
+            self._RIESGO_BASE[banda_fallback]
+            * self.densidad_normalizada_banda(banda_fallback),
+            0.1,
+        )
+        resultado[~procesadas] = riesgo_fallback
         return resultado
 
     def generar_debris_por_colision(self, altitud_km: float, masa_kg: float,
@@ -2337,7 +2350,16 @@ class SimulacionSatelites:
             Instancia restaurada de `SimulacionSatelites`.
         """
         with open(ruta, "rb") as f:
-            return pickle.load(f)
+            simulacion = pickle.load(f)
+        # `Satellite._contador` es un atributo de clase y no se serializa
+        # con el checkpoint: al restaurarlo en un proceso nuevo arrancaria
+        # en 0 y los proximos satelites lanzados recibirian IDs ya usados
+        # (colision de IDs que romperia `pariente_id` y los linajes).
+        ids_existentes = [s.id for s in simulacion.satelites_activos]
+        ids_existentes += [s.id for s in simulacion.satelites_muertos]
+        if ids_existentes:
+            Satellite._contador = max(Satellite._contador, max(ids_existentes))
+        return simulacion
     
     def obtener_estadisticas_finales(self) -> Dict:
         """

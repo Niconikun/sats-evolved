@@ -139,6 +139,18 @@ class TestDebrisEspacial:
 
         np.testing.assert_allclose(obtenido, esperado)
 
+    def test_probabilidad_colision_batch_coincide_con_escalar_fuera_de_bandas(self, config):
+        # Las altitudes fuera de toda banda (negativas, por encima del
+        # tope GEO) deben usar el mismo fallback que la version escalar
+        # (_banda_de_altitud), no quedar con riesgo 0.
+        debris = DebrisEspacial(densidad_inicial=800, config=config)
+        altitudes = np.array([-50.0, -0.1, 0.0, 399.999, 2000.0, 35786.0, 1e9])
+
+        esperado = np.array([debris.probabilidad_colision(a) for a in altitudes])
+        obtenido = debris.probabilidad_colision_batch(altitudes)
+
+        np.testing.assert_allclose(obtenido, esperado)
+
     def test_generar_debris_por_colision_incrementa_banda(self, config):
         debris = DebrisEspacial(densidad_inicial=100, config=config)
         antes = debris.densidad_por_banda["leo_congestionado"]
@@ -345,6 +357,27 @@ class TestSimulacionSatelites:
         # Debe poder seguir avanzando sin errores tras restaurarse.
         restaurado.ejecutar_simulacion(dias_totales=5)
         assert restaurado.dias_transcurridos == sim.dias_transcurridos + 5
+
+    def test_checkpoint_restaura_contador_de_ids(self, tmp_path):
+        # `Satellite._contador` es un atributo de clase y no viaja en el
+        # pickle de la simulacion: cargar un checkpoint en un proceso
+        # nuevo no debe reutilizar IDs ya asignados (romperia linajes).
+        sim = self._correr(semilla=57, dias=20)
+        ruta = tmp_path / "checkpoint_ids.pkl"
+        sim.guardar_checkpoint(str(ruta))
+
+        contador_previo = Satellite._contador
+        Satellite._contador = 0  # simula un proceso nuevo
+        try:
+            restaurado = SimulacionSatelites.cargar_checkpoint(str(ruta))
+            ids_existentes = {s.id for s in
+                               restaurado.satelites_activos + restaurado.satelites_muertos}
+            nuevos = restaurado.lanzar_satelites()
+            for sat in nuevos:
+                assert sat.id not in ids_existentes
+            assert Satellite._contador >= max(ids_existentes)
+        finally:
+            Satellite._contador = contador_previo
 
     def test_checkpoint_es_picklable_directamente(self):
         sim = self._correr(semilla=3, dias=10)
