@@ -87,6 +87,10 @@ class ConfiguracionFisica:
 
     # Metabolismo
     consumo_energico_diario_pct: float = 5.0
+    # Recarga solar diaria (puntos porcentuales de energía, ver
+    # `actualizar_metabolismo_batch`); antes estaba hardcodeada como un
+    # número mágico `+10.0` dentro de la función.
+    recarga_solar_diaria_pct: float = 10.0
 
     # Tasas aditivas de falla (ver Satellite.calcular_lambda_total)
     factor_lambda_radiacion: float = 0.002
@@ -1361,7 +1365,8 @@ def aplicar_radiacion_cosmica_batch(satelites: List['Satellite'],
     return radiacion_arr >= limite_arr
 
 
-def actualizar_metabolismo_batch(satelites: List['Satellite']) -> np.ndarray:
+def actualizar_metabolismo_batch(satelites: List['Satellite'],
+                                config: Optional[ConfiguracionFisica] = None) -> np.ndarray:
     """
     Versión vectorizada de la recarga/consumo diario de energía
     (:meth:`Satellite.recargar_energia` + :meth:`Satellite.consumir_energia`).
@@ -1370,6 +1375,9 @@ def actualizar_metabolismo_batch(satelites: List['Satellite']) -> np.ndarray:
 
     Args:
         satelites: lista de satélites a actualizar.
+        config: configuración física compartida que provee
+            `recarga_solar_diaria_pct`; si es None, se usan los valores
+            por defecto (compatibilidad con llamadas previas).
 
     Returns:
         Array booleano indicando qué satélites se quedaron sin energía
@@ -1379,10 +1387,12 @@ def actualizar_metabolismo_batch(satelites: List['Satellite']) -> np.ndarray:
     if n == 0:
         return np.zeros(0, dtype=bool)
 
+    config_efectiva = config or ConfiguracionFisica()
     energia_arr = np.array([s.energia for s in satelites], dtype=float)
     consumo_arr = np.array([s.consumo_energico_diario for s in satelites], dtype=float)
 
-    energia_arr = np.minimum(energia_arr + 10.0, 100.0) - consumo_arr
+    energia_arr = (np.minimum(energia_arr + config_efectiva.recarga_solar_diaria_pct, 100.0)
+                   - consumo_arr)
 
     for idx, sat in enumerate(satelites):
         sat.energia = float(energia_arr[idx])
@@ -2087,7 +2097,10 @@ class SimulacionSatelites:
                 sat.causa_muerte = "reentrada_orbital"
                 self.satelites_muertos.append(sat)
                 self._registrar_causa_muerte(sat.causa_muerte)
-                self.debris.generar_debris_derelicto(sat.altitud_km())
+                # A diferencia del resto de causas, un satélite que
+                # reentra se desintegra en la atmósfera: no deja debris
+                # derelicto en su banda orbital (el drag elimina el
+                # objeto, no lo convierte en riesgo de colisión).
 
         supervivientes_drag = [sat for sat in activos if sat.activo]
 
@@ -2111,7 +2124,7 @@ class SimulacionSatelites:
         supervivientes_radiacion = [sat for sat in supervivientes_drag if sat.activo]
 
         # 4. Metabolismo: recarga y consumo de energía (vectorizado)
-        mascara_sin_energia = actualizar_metabolismo_batch(supervivientes_radiacion)
+        mascara_sin_energia = actualizar_metabolismo_batch(supervivientes_radiacion, self.config)
         for sat, sin_energia in zip(supervivientes_radiacion, mascara_sin_energia):
             if sin_energia:
                 sat.activo = False
@@ -2280,6 +2293,7 @@ class SimulacionSatelites:
         return float(np.mean([sat.calidad_inherente for sat in self.satelites_activos]))
     
     def ejecutar_simulacion(self, dias_totales: int = 1825,
+                           heredables: Optional[bool] = None,
                            checkpoint_cada_dias: Optional[int] = None,
                            checkpoint_ruta: str = "checkpoint_simulacion.pkl") -> List[Dict]:
         """
@@ -2291,6 +2305,11 @@ class SimulacionSatelites:
         Args:
             dias_totales: cantidad total de días a simular (por defecto
                 1825 días = 5 años).
+            heredables: si es True/False, sobrescribe `reproductor_habilitado`
+                durante la ejecución (equivalente a pasar el parámetro al
+                constructor). Si es None (por defecto), se usa el valor del
+                constructor. Se acepta por compatibilidad con la firma
+                documentada en el README.
             checkpoint_cada_dias: si se especifica, guarda un checkpoint
                 (ver :meth:`guardar_checkpoint`) cada esta cantidad de
                 días, para poder reanudar la simulación tras una
@@ -2306,6 +2325,8 @@ class SimulacionSatelites:
         print(f"  - Ciclos solares: Habilitados")
         print(f"  - Debris espacial: Habilitado")
         print(f"  - Radiación cósmica: Habilitada")
+        if heredables is not None:
+            self.reproductor_habilitado = bool(heredables)
         print(f"  - Heredabilidad: {'Habilitada' if self.reproductor_habilitado else 'Deshabilitada'}")
         print(f"Tiempo inicial: {self.tiempo_actual}\n")
         

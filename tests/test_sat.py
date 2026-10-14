@@ -281,6 +281,19 @@ class TestFuncionesBatch:
 
         np.testing.assert_allclose(lambda_batch, lambda_escalar, rtol=1e-10)
 
+    def test_metabolismo_batch_respeta_recarga_solar_configurable(self, config, rng):
+        # La recarga solar (+10 por defecto) debe venir de la
+        # configuracion, no estar hardcodeada en la funcion batch.
+        config_recarga = ConfiguracionFisica(recarga_solar_diaria_pct=20.0)
+        poblacion = self._crear_poblacion(config_recarga, rng)
+        for sat in poblacion:
+            sat.energia = 50.0
+        actualizar_metabolismo_batch(poblacion, config_recarga)
+        # 50 + 20 de recarga - 5 de consumo
+        np.testing.assert_allclose(
+            np.array([s.energia for s in poblacion]), 65.0, rtol=1e-10
+        )
+
 
 # =============================================================================
 # SimulacionSatelites: reproducibilidad, historial, checkpointing
@@ -378,6 +391,42 @@ class TestSimulacionSatelites:
             assert Satellite._contador >= max(ids_existentes)
         finally:
             Satellite._contador = contador_previo
+
+    def test_ejecutar_simulacion_parametro_heredables(self):
+        # El README documenta `ejecutar_simulacion(..., heredables=...)`;
+        # debe sobrescribir reproductor_habilitado durante la ejecucion.
+        sim = SimulacionSatelites(
+            tiempo_inicio=datetime(2024, 1, 1), semilla=61,
+            reproductor_habilitado=True,
+        )
+        sim.lanzar_satelites()
+        sim.ejecutar_simulacion(dias_totales=10, heredables=False)
+        assert sim.reproductor_habilitado is False
+
+        sim2 = SimulacionSatelites(
+            tiempo_inicio=datetime(2024, 1, 1), semilla=62,
+            reproductor_habilitado=False,
+        )
+        sim2.lanzar_satelites()
+        sim2.ejecutar_simulacion(dias_totales=10, heredables=True)
+        assert sim2.reproductor_habilitado is True
+
+    def test_reentrada_orbital_no_genera_debris(self):
+        # Un satelite que reentra se desintegra en la atmosfera: no debe
+        # dejar un derelicto en su banda orbital como las otras causas.
+        sim = SimulacionSatelites(
+            tiempo_inicio=datetime(2024, 1, 1), semilla=63,
+            intervalo_lanzamiento_dias=1000,  # sin lanzamientos nuevos
+        )
+        sim.lanzar_satelites()
+        debris_antes = sim.debris.densidad
+        for sat in sim.satelites_activos:
+            sat.a = sim.config.radio_tierra_km + 50.0  # fuerza reentrada
+        sim.paso_tiempo(1)
+        reentrados = [s for s in sim.satelites_muertos
+                      if s.causa_muerte == "reentrada_orbital"]
+        assert len(reentrados) > 0
+        assert sim.debris.densidad <= debris_antes
 
     def test_checkpoint_es_picklable_directamente(self):
         sim = self._correr(semilla=3, dias=10)
